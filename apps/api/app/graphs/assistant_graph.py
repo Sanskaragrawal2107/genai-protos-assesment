@@ -1,7 +1,8 @@
-"""Production Conversational AI Recruiter Assistant with OpenAI Tool Calling (gpt-5-nano).
+"""Conversational AI Recruiter Assistant.
 
-Replaces rigid, deterministic branching with full multi-turn conversational reasoning,
-thread history awareness, and direct function-calling against workspace tools.
+Orchestration is LangChain's ``create_agent``; external app tools and per-user
+auth come from a Composio session (``Composio.create(...).tools()``). Recruiter
+actions stay as thin LangChain tools so candidate data and approvals persist.
 """
 from __future__ import annotations
 
@@ -20,7 +21,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from .. import db as db_module
 from ..composio import IntegrationError
 from ..config import settings
-from ..http import get_client
 from ..db import (
     candidate_communications,
     candidates,
@@ -43,6 +43,17 @@ from ..services import communications as comms
 from ..services import interviews as interview_svc
 from ..services import verification
 from ..services.interviews import upcoming_interviews
+
+# Composio owns tool discovery + per-user auth (Connect Links); LangChain owns
+# the tool-calling loop. This replaces the hand-written OpenAI tool-call parser
+# and the bespoke calendar provider classes.
+from composio import Composio
+from composio_langchain import LangchainProvider
+from json_schema_to_pydantic import create_model as _schema_model
+from langchain.agents import create_agent
+from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.tools import StructuredTool
+from langchain_openai import ChatOpenAI
 
 log = logging.getLogger("recruiter.assistant_agent")
 
@@ -334,6 +345,9 @@ CRITICAL INSTRUCTIONS & RECRUITER POLICIES:
        - If a `schedule_interview` attempt fails with a Microsoft Teams error (authentication, token, or not-connected), do NOT retry Teams in that same turn. Report the failure once and, when the recruiter has asked for Google Meet or agreed to it, call `schedule_interview` with `meeting_provider="google_meet"` immediately.
        - Only ever report a join link that the tool actually returned. Never claim a Teams or Meet link was generated when the tool returned an error, and never invent a link or a calendar-invite placeholder.
        - After switching, state clearly that the platform is now Google Meet and include the real join link returned by the tool.
+     - App connections (Composio):
+       - If an external app (Gmail, Google Calendar, Google Meet, Microsoft Teams, GitHub) is not connected, call `COMPOSIO_MANAGE_CONNECTIONS` for that toolkit and share the returned Connect Link with the recruiter. Never say you cannot connect an account, and never ask the recruiter to paste credentials.
+       - When you need an app action that is not covered by a recruiter tool above, use `COMPOSIO_SEARCH_TOOLS` to find the right tool and `COMPOSIO_MULTI_EXECUTE_TOOL` to run it. Never fabricate a result or a link.
 4. Technical Verification:
    - Use `verify_candidate` to look up LeetCode ratings, problem counts, and GitHub repositories.
    - If the recruiter provides a LeetCode or GitHub profile URL, pass it to `verify_candidate` as `leetcode_url` / `github_url`. Never report a profile as "not verified" when the recruiter just gave you a URL — call the tool with that URL first.
@@ -935,31 +949,129 @@ async def execute_tool_call(
     return {"status": "ok", "message": f"Action {name} processed."}
 
 
-# --------------------------------------------------------------------- OpenAI Chat Caller
-async def _call_openai(
-    messages: list[dict[str, Any]],
-    tools: list[dict[str, Any]] | None = None,
-    tool_choice: str | None = "auto",
-) -> dict[str, Any]:
-    url = settings.openai_base_url.rstrip("/") + "/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {settings.openai_api_key}",
-        "Content-Type": "application/json",
-    }
-    payload: dict[str, Any] = {
-        "model": settings.llm_model,
-        "messages": messages,
-        "max_completion_tokens": 16384,
-    }
-    if tools:
-        payload["tools"] = tools
-        if tool_choice:
-            payload["tool_choice"] = tool_choice
+# --------------------------------------------------------------------- Agent (Composio + LangChain)
+COMPOSIO_TOOLKITS = ["gmail", "googlecalendar", "googlemeet", "microsoft_teams", "github"]
 
-    resp = await get_client().post(url, json=payload, headers=headers, timeout=90)
-    if resp.status_code >= 400:
-        raise RuntimeError(f"OpenAI error {resp.status_code}: {resp.text[:200]}")
-    return resp.json()
+# Cache the session's LangChain tools per workspace. Session creation does a
+# network round-trip, so we keep it warm for the same 25 minutes the MCP path
+# uses. The tools close over the session, so caching the tools keeps it alive.
+_COMPOSIO_TOOL_CACHE: dict[str, tuple[float, list[Any]]] = {}
+
+_COMPOSIO_LABELS: dict[str, tuple[str, str]] = {
+    "COMPOSIO_SEARCH_TOOLS": ("composio", "Finding the right app tool"),
+    "COMPOSIO_GET_TOOL_SCHEMAS": ("composio", "Inspecting a tool schema"),
+    "COMPOSIO_MULTI_EXECUTE_TOOL": ("composio", "Running an app action"),
+    "COMPOSIO_MANAGE_CONNECTIONS": ("composio", "Connecting an app"),
+    "COMPOSIO_REMOTE_WORKBENCH": ("composio", "Remote workbench"),
+    "COMPOSIO_REMOTE_BASH_TOOL": ("composio", "Remote shell"),
+}
+
+
+def _composio_user_id(workspace_id: str) -> str:
+    return f"{settings.composio_user_prefix}:{workspace_id}"
+
+
+def _load_composio_tools(workspace_id: str) -> list[Any]:
+    """Blocking: create a Composio session and return its LangChain tools.
+
+    Exactly the pattern from the Composio LangChain docs:
+
+        Composio(provider=LangchainProvider()).create(user_id=..., toolkits=[...]).tools()
+
+    The session exposes meta-tools (search / manage connections / execute), so
+    there is no per-toolkit boilerplate to maintain.
+    """
+    if not settings.composio_enabled:
+        return []
+    kwargs: dict[str, Any] = {
+        "api_key": settings.composio_api_key,
+        "provider": LangchainProvider(),
+    }
+    if settings.composio_base_url:
+        kwargs["base_url"] = settings.composio_base_url.rstrip("/")
+    session = Composio(**kwargs).create(
+        user_id=_composio_user_id(workspace_id),
+        toolkits=COMPOSIO_TOOLKITS,
+    )
+    return list(session.tools())
+
+
+async def _composio_tools(workspace_id: str) -> list[Any]:
+    cached = _COMPOSIO_TOOL_CACHE.get(workspace_id)
+    if cached and (time.time() - cached[0]) < 25 * 60:
+        return cached[1]
+    try:
+        tools = await asyncio.to_thread(_load_composio_tools, workspace_id)
+    except Exception as exc:  # noqa: BLE001 - never block a chat turn on Composio
+        log.warning("composio session unavailable: %s", exc)
+        return []
+    _COMPOSIO_TOOL_CACHE[workspace_id] = (time.time(), tools)
+    return tools
+
+
+def _domain_tools(
+    *,
+    session: AsyncSession,
+    workspace_id: str,
+    recruiter_id: str | None,
+    user_message: str,
+    accumulated_candidates: list[dict[str, Any]],
+    accumulated_pending: list[dict[str, Any]],
+) -> list[Any]:
+    """Expose the recruiter actions to LangChain.
+
+    Reuses the existing ``AGENT_TOOLS`` schemas and ``execute_tool_call``
+    dispatcher, so candidate search, verification, scheduling and approvals keep
+    working with no rewrite. Each OpenAI schema is converted to a pydantic model
+    and wrapped as a LangChain ``StructuredTool``.
+    """
+    tools: list[Any] = []
+    for spec in AGENT_TOOLS:
+        fn = spec["function"]
+        name = fn["name"]
+        schema = dict(fn.get("parameters") or {"type": "object", "properties": {}})
+        schema.setdefault("title", name)
+        args_schema = _schema_model(schema)
+
+        async def _run(*, _name: str = name, **kwargs: Any) -> str:
+            # Deterministic safety net: if the model forgets the provider on a
+            # switch request, honour the recruiter's latest message.
+            if _name == "schedule_interview" and not (kwargs.get("meeting_provider") or "").strip():
+                hint = provider_hint_from_message(user_message)
+                if hint:
+                    kwargs["meeting_provider"] = hint
+            result = await execute_tool_call(
+                name=_name,
+                args=kwargs,
+                session=session,
+                workspace_id=workspace_id,
+                recruiter_id=recruiter_id,
+                accumulated_candidates=accumulated_candidates,
+                accumulated_pending=accumulated_pending,
+            )
+            if not isinstance(result, dict):
+                result = {"status": "ok", "message": str(result)}
+            return json.dumps(result, default=str)
+
+        tools.append(
+            StructuredTool.from_function(
+                coroutine=_run,
+                name=name,
+                description=fn.get("description", ""),
+                args_schema=args_schema,
+            )
+        )
+    return tools
+
+
+def _build_agent(tools: list[Any]) -> Any:
+    model = ChatOpenAI(
+        model=settings.llm_model,
+        api_key=settings.openai_api_key,
+        base_url=settings.openai_base_url,
+        temperature=settings.llm_temperature,
+    )
+    return create_agent(model=model, tools=tools, system_prompt=SYSTEM_PROMPT)
 
 
 # --------------------------------------------------------------------- Streaming Turn Runner
@@ -1030,112 +1142,136 @@ async def run_assistant_stream(
     accumulated_pending: list[dict[str, Any]] = []
     final_reply: str = ""
 
-    # Step indicator for classify / understanding
+    # Step indicator for the agent turn
     yield {
         "type": "step",
         "id": "understand",
-        "tool": "gpt-5-nano",
-        "label": "Analyzing request & conversation context",
+        "tool": settings.llm_model,
+        "label": "Thinking with the recruiting agent",
         "status": "running",
         "detail": user_message[:120],
     }
 
     try:
-        call_resp = await _call_openai(messages, tools=AGENT_TOOLS)
-        choice = call_resp["choices"][0]
-        msg = choice["message"]
-        tool_calls = msg.get("tool_calls") or []
+        composio_tools = await _composio_tools(workspace_id)
+        tools = _domain_tools(
+            session=session,
+            workspace_id=workspace_id,
+            recruiter_id=recruiter_id,
+            user_message=user_message,
+            accumulated_candidates=accumulated_candidates,
+            accumulated_pending=accumulated_pending,
+        ) + composio_tools
+        agent = _build_agent(tools)
+
+        # ``messages`` still starts with the system prompt; create_agent owns it.
+        lc_messages = [
+            HumanMessage(content=row["content"]) if row["role"] == "user" else AIMessage(content=row["content"])
+            for row in messages[1:]
+        ]
 
         yield {
             "type": "step",
             "id": "understand",
-            "tool": "gpt-5-nano",
-            "label": "Analyzing request & conversation context",
+            "tool": settings.llm_model,
+            "label": "Thinking with the recruiting agent",
             "status": "done",
-            "summary": f"Selected {len(tool_calls)} action(s)" if tool_calls else "Direct response",
-            "ms": 400,
+            "summary": f"{len(tools)} tools ready",
+            "ms": 1,
         }
 
-        if tool_calls:
-            # Append assistant message with tool calls to history
-            messages.append(msg)
+        started_at: dict[str, float] = {}
+        streamed = False
 
-            for tc in tool_calls:
-                call_id = tc["id"]
-                fn_name = tc["function"]["name"]
-                meta = TOOL_METADATA.get(fn_name, {"label": f"Running {fn_name}", "tool": fn_name})
+        async for event in agent.astream_events({"messages": lc_messages}, version="v2"):
+            kind = event.get("event")
+            run_id = str(event.get("run_id") or "")
+            name = event.get("name") or ""
 
-                raw_args = tc["function"].get("arguments") or "{}"
-                try:
-                    args = json.loads(raw_args)
-                except Exception:
-                    args = {}
+            if kind == "on_chat_model_stream":
+                chunk = event.get("data", {}).get("chunk")
+                text = getattr(chunk, "content", None)
+                if isinstance(text, list):
+                    text = "".join(
+                        part.get("text", "") if isinstance(part, dict) else str(part) for part in text
+                    )
+                if text:
+                    streamed = True
+                    final_reply += text
+                    yield {"type": "token", "text": text}
 
-                # Deterministic safety net: if the model forgot to pass a
-                # meeting provider on a scheduling call but the recruiter just
-                # told us to switch (e.g. "go for Google Meet"), honor it here
-                # instead of silently falling back to the workspace default.
-                if fn_name == "schedule_interview" and not (args.get("meeting_provider") or "").strip():
-                    hint = provider_hint_from_message(user_message)
-                    if hint:
-                        args["meeting_provider"] = hint
+            elif kind == "on_chat_model_end" and not streamed:
+                # Some OpenAI-compatible proxies do not stream tokens; keep the
+                # final answer from the model-end event in that case.
+                out = event.get("data", {}).get("output")
+                content = getattr(out, "content", None)
+                if isinstance(content, list):
+                    content = "".join(
+                        part.get("text", "") if isinstance(part, dict) else str(part) for part in content
+                    )
+                if content:
+                    final_reply = str(content)
 
-                # Emit step start
-                arg_summary = ", ".join(f"{k}={v}" for k, v in list(args.items())[:2])
+            elif kind == "on_tool_start":
+                started_at[run_id] = time.perf_counter()
+                meta = TOOL_METADATA.get(name)
+                if meta:
+                    tool_key, label = meta["tool"], meta["label"]
+                else:
+                    tool_key, label = _COMPOSIO_LABELS.get(
+                        name, (name.lower(), name.replace("_", " ").title())
+                    )
+                detail = ""
+                tool_input = event.get("data", {}).get("input")
+                if isinstance(tool_input, dict):
+                    detail = ", ".join(f"{k}={v}" for k, v in list(tool_input.items())[:2])
                 yield {
                     "type": "step",
-                    "id": call_id,
-                    "tool": meta["tool"],
-                    "label": meta["label"],
+                    "id": run_id,
+                    "tool": tool_key,
+                    "label": label,
                     "status": "running",
-                    "detail": arg_summary[:100],
+                    "detail": str(detail)[:100],
                 }
 
-                start_t = time.perf_counter()
-                tool_res = await execute_tool_call(
-                    name=fn_name,
-                    args=args,
-                    session=session,
-                    workspace_id=workspace_id,
-                    recruiter_id=recruiter_id,
-                    accumulated_candidates=accumulated_candidates,
-                    accumulated_pending=accumulated_pending,
+            elif kind == "on_tool_end":
+                meta = TOOL_METADATA.get(name)
+                if meta:
+                    tool_key, label = meta["tool"], meta["label"]
+                else:
+                    tool_key, label = _COMPOSIO_LABELS.get(
+                        name, (name.lower(), name.replace("_", " ").title())
+                    )
+                elapsed_ms = int(
+                    (time.perf_counter() - started_at.get(run_id, time.perf_counter())) * 1000
                 )
-                if not isinstance(tool_res, dict):
-                    tool_res = {"status": "ok", "message": str(tool_res) if tool_res is not None else "Completed"}
-                elapsed_ms = int((time.perf_counter() - start_t) * 1000)
-
-                # Emit step done
+                output = event.get("data", {}).get("output")
+                summary = getattr(output, "content", None) or output
                 yield {
                     "type": "step",
-                    "id": call_id,
-                    "tool": meta["tool"],
-                    "label": meta["label"],
+                    "id": run_id,
+                    "tool": tool_key,
+                    "label": label,
                     "status": "done",
-                    "summary": str(tool_res.get("message") or tool_res.get("summary") or "Completed")[:120],
+                    "summary": str(summary)[:120],
                     "ms": elapsed_ms,
                 }
 
-                # Append tool response
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": call_id,
-                    "content": json.dumps(tool_res),
-                })
-
-            # Call model again to generate final natural response
-            second_resp = await _call_openai(messages, tools=AGENT_TOOLS, tool_choice="none")
-            final_reply = second_resp["choices"][0]["message"].get("content") or ""
-        else:
-            final_reply = msg.get("content") or "I have processed your request."
+        if not final_reply:
+            final_reply = "I processed your request."
 
     except Exception as exc:
         log.exception("Assistant agent execution failed")
         final_reply = f"I encountered an issue processing your request: {exc}"
-
-    # 3. Stream reply tokens to client
-    async for event in _stream_reply(final_reply):
-        yield event
+        yield {
+            "type": "step",
+            "id": "understand",
+            "tool": settings.llm_model,
+            "label": "Thinking with the recruiting agent",
+            "status": "error",
+            "summary": str(exc)[:120],
+            "ms": 0,
+        }
 
     # 4. Save assistant message with structured payload
     payload = to_jsonable({
