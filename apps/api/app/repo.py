@@ -245,6 +245,7 @@ def candidate_summary(row: dict[str, Any]) -> dict[str, Any]:
         "github_url": row.get("github_url"),
         "leetcode_url": row.get("leetcode_url"),
         "linkedin_url": row.get("linkedin_url"),
+        "portfolio_url": row.get("portfolio_url"),
         "pipeline_status": row.get("pipeline_status") or "APPLIED",
         "resume_storage_path": row.get("resume_storage_path"),
         "created_at": row.get("created_at"),

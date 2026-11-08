@@ -15,7 +15,6 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 
-import httpx
 from mcp import ClientSession
 from mcp.client.streamable_http import create_mcp_http_client, streamable_http_client
 
@@ -195,15 +194,15 @@ def _normalise(username: str, profile_raw: Any, contest_raw: Any) -> dict[str, A
 
 async def _fetch(username: str) -> dict[str, Any]:
     headers = {"Authorization": f"Bearer {settings.leetcode_mcp_token}"}
-    http_client = create_mcp_http_client(
-        headers=headers,
-        timeout=httpx.Timeout(connect=10.0, read=45.0, write=15.0, pool=15.0),
-    )
+    # mcp 2.x vendors its own httpx (`httpx2`) and create_mcp_http_client expects
+    # an httpx2.Timeout — passing an httpx.Timeout breaks its internal timeout
+    # arithmetic. Rely on MCP's default timeouts; the whole fetch is bounded by
+    # leetcode_mcp_timeout_seconds via asyncio.wait_for in fetch_leetcode_evidence.
+    http_client = create_mcp_http_client(headers=headers)
     async with http_client:
         async with streamable_http_client(settings.leetcode_mcp_url, http_client=http_client) as (
             read,
             write,
-            _,
         ):
             async with ClientSession(read, write) as session:
                 await asyncio.wait_for(session.initialize(), timeout=15)

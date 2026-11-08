@@ -19,10 +19,31 @@ from dataclasses import dataclass
 from ..db import utcnow
 from ..llm import LLMError, LLMUnavailable, llm, wrap_document
 from ..schemas import ResumeEducation, ResumeExtraction, ResumeProject
+from .profile_links import classify_url
 
 log = logging.getLogger("recruiter.resume")
 
 SUPPORTED_EXTENSIONS = {"pdf", "docx", "doc"}
+
+
+def normalize_profile_urls(data: ResumeExtraction) -> ResumeExtraction:
+    """Place each extracted URL in its canonical field by host.
+
+    Extraction can mislabel: a GitHub link recorded as ``portfolio_url``, or a
+    personal site recorded as ``github_url``. Classifying by host keeps the
+    canonical columns correct and reserves ``portfolio_url`` for the personal
+    website, which verification then crawls for any missing profiles.
+    """
+    by_kind: dict[str, str] = {}
+    for url in (data.github_url, data.leetcode_url, data.linkedin_url, data.portfolio_url):
+        if not url:
+            continue
+        by_kind.setdefault(classify_url(url), url)
+    data.github_url = by_kind.get("github")
+    data.leetcode_url = by_kind.get("leetcode")
+    data.linkedin_url = by_kind.get("linkedin")
+    data.portfolio_url = by_kind.get("website")
+    return data
 
 
 class ResumeParseError(RuntimeError):
@@ -356,7 +377,7 @@ def heuristic_extract(text: str, *, email_hint: str | None = None) -> ResumeExtr
     role, company = _role(lines)
     summary_lines = sections.get("summary") or sections.get("profile") or []
 
-    return ResumeExtraction(
+    extracted = ResumeExtraction(
         full_name=_guess_name(lines),
         email=email_match.group(0) if email_match else (email_hint or None),
         phone=phone_match.group(0).strip() if phone_match else None,
@@ -380,6 +401,7 @@ def heuristic_extract(text: str, *, email_hint: str | None = None) -> ResumeExtr
         linkedin_url=linkedin,
         portfolio_url=portfolio,
     )
+    return normalize_profile_urls(extracted)
 
 
 # -------------------------------------------------------------------- LLM
@@ -389,7 +411,11 @@ _SYSTEM = (
     "field the resume does not explicitly state. Never guess a phone number, a "
     "company, a graduation year, a URL or a number of years of experience. "
     "Normalise skill names to their common spelling. Keep experience_years as a "
-    "decimal number computed from stated employment dates only."
+    "decimal number computed from stated employment dates only. "
+    "Place URLs in the correct field by kind: a GitHub profile in github_url, a "
+    "LeetCode profile in leetcode_url, a LinkedIn profile in linkedin_url, and any "
+    "personal website, portfolio or other personal link in portfolio_url. Never "
+    "put a social profile URL in portfolio_url."
 )
 
 _SCHEMA_HINT = """{
@@ -442,7 +468,7 @@ async def parse_resume(text: str, *, filename: str, email_hint: str | None = Non
     )
     try:
         raw = await llm.complete_json(system=_SYSTEM, user=prompt)
-        data = ResumeExtraction.model_validate(raw)
+        data = normalize_profile_urls(ResumeExtraction.model_validate(raw))
         return ParsedResume(data=data, method="llm", confidence=_confidence(data), warnings=[])
     except (LLMUnavailable, LLMError, ValueError) as exc:
         log.error("LLM resume extraction failed: %s", exc)

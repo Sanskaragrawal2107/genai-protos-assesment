@@ -390,7 +390,7 @@ async def verify_candidate(candidate_id: str, keywords: list[str] | None = None)
         if not candidate:
             raise ValueError("Candidate not found")
         evidence = await run_verification(
-            candidate, keywords=keywords or candidate.get("skills") or []
+            candidate, keywords=keywords or candidate.get("skills") or [], enrich=True
         )
         return _j(evidence)
 

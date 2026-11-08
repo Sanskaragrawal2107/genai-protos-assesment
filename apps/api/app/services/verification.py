@@ -22,6 +22,7 @@ import httpx
 
 from ..config import settings
 from ..http import get_client
+from . import profile_links
 
 log = logging.getLogger("recruiter.verify")
 
@@ -305,17 +306,67 @@ def evidence_score(github: dict[str, Any], leetcode: dict[str, Any]) -> tuple[fl
     return round(min(score, 100.0), 1), signals
 
 
-async def verify_candidate(candidate: dict[str, Any], *, keywords: list[str]) -> dict[str, Any]:
-    """Run both verifications concurrently and package the evidence."""
+async def verify_candidate(
+    candidate: dict[str, Any], *, keywords: list[str], enrich: bool = False
+) -> dict[str, Any]:
+    """Run both verifications concurrently and package the evidence.
+
+    When ``enrich`` is set and a personal website/portfolio is on file, that page
+    is fetched once so any GitHub/LeetCode links it exposes can be verified even
+    when the resume itself did not list them. Without ``enrich`` this behaves as
+    before (used by the batch evaluation path, which must stay fast).
+    """
+    github_url = candidate.get("github_url")
+    leetcode_url = candidate.get("leetcode_url")
+
+    # The portfolio column may in fact hold a social URL (resume extraction can
+    # mislabel it); classify it before deciding whether to crawl.
+    website_url = candidate.get("portfolio_url")
+    if website_url:
+        kind = profile_links.classify_url(website_url)
+        if kind == "github" and not github_url:
+            github_url = website_url
+        elif kind == "leetcode" and not leetcode_url:
+            leetcode_url = website_url
+
+    website: dict[str, Any] | None = None
+    discovered: dict[str, str] = {}
+    if enrich and website_url and (not github_url or not leetcode_url):
+        website = await profile_links.fetch_website(website_url)
+        if website.get("available"):
+            discovered = profile_links.profiles_from_links(website.get("links") or {})
+            github_url = github_url or discovered.get("github_url")
+            leetcode_url = leetcode_url or discovered.get("leetcode_url")
+
     github, leetcode = await asyncio.gather(
-        verify_github(candidate.get("github_url"), keywords=keywords),
-        verify_leetcode(candidate.get("leetcode_url")),
+        verify_github(github_url, keywords=keywords),
+        verify_leetcode(leetcode_url),
     )
+    # Record when a URL was learned by crawling the personal website, so the UI
+    # can show where the evidence came from.
+    if discovered.get("github_url") and github_url == discovered["github_url"]:
+        github["discovered_from"] = website_url
+    if discovered.get("leetcode_url") and leetcode_url == discovered["leetcode_url"]:
+        leetcode["discovered_from"] = website_url
+
     score, signals = evidence_score(github, leetcode)
-    return {
+    if website is not None:
+        if website.get("available"):
+            note = f"Personal website checked: {website.get('final_url') or website_url}"
+            if discovered:
+                note += " (discovered " + ", ".join(sorted(discovered)) + ")"
+            signals.append(note)
+        else:
+            signals.append(f"Personal website not checked: {website.get('reason')}")
+
+    result: dict[str, Any] = {
         "github": github,
         "leetcode": leetcode,
         "evidence_score": score,
         "signals": signals,
         "verified_at": _now(),
     }
+    if website is not None:
+        result["website"] = website
+        result["discovered"] = discovered
+    return result

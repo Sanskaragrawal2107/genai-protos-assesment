@@ -176,12 +176,25 @@ AGENT_TOOLS = [
             "name": "verify_candidate",
             "description": (
                 "Verify candidate technical credentials: uses LeetCode FastMCP for problem rankings, ratings, and solved count, "
-                "and checks GitHub repositories."
+                "and checks GitHub repositories. If the recruiter supplies a LeetCode or GitHub profile URL, pass it in "
+                "leetcode_url/github_url so it is saved on the candidate and actually checked."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "candidate_name_or_id": {"type": "string", "description": "Candidate name or UUID"},
+                    "leetcode_url": {
+                        "type": "string",
+                        "description": "LeetCode profile URL supplied by the recruiter, e.g. https://leetcode.com/u/<handle>/. Saved to the candidate and used for verification.",
+                    },
+                    "github_url": {
+                        "type": "string",
+                        "description": "GitHub profile URL supplied by the recruiter, e.g. https://github.com/<handle>. Saved to the candidate and used for verification.",
+                    },
+                    "profile_url": {
+                        "type": "string",
+                        "description": "Personal website / portfolio URL supplied by the recruiter. Saved to the candidate; when GitHub or LeetCode are missing, the tool crawls this page to discover them and then verifies.",
+                    },
                 },
                 "required": ["candidate_name_or_id"],
             },
@@ -316,6 +329,8 @@ CRITICAL INSTRUCTIONS & RECRUITER POLICIES:
        - NEVER say "I can't create the live meeting link in this turn", "join link to be generated", or "placeholder". The tool creates and returns the live join link immediately!
 4. Technical Verification:
    - Use `verify_candidate` to look up LeetCode ratings, problem counts, and GitHub repositories.
+   - If the recruiter provides a LeetCode or GitHub profile URL, pass it to `verify_candidate` as `leetcode_url` / `github_url`. Never report a profile as "not verified" when the recruiter just gave you a URL — call the tool with that URL first.
+   - If the recruiter provides a personal website or portfolio URL, pass it as `profile_url`. The tool saves it, and when GitHub/LeetCode are missing it crawls the page to discover and then verify them. Report what it found on the website.
 5. Proactive, Executive Assistance:
    - Be professional, concise, proactive, and clear. Always outline next steps.
 """
@@ -724,28 +739,112 @@ async def execute_tool_call(
         if not cand:
             return {"error": "Candidate not found."}
 
-        v = await verification.verify_candidate(cand, keywords=list(cand.get("skills") or []))
+        # A recruiter may paste profile URLs in chat. Validate them, persist them
+        # on the candidate (so later runs and the dashboard see them), and verify
+        # against the merged record rather than the stale one — otherwise the
+        # URLs are silently ignored and LeetCode/GitHub always reports "not
+        # verified".
+        updates: dict[str, Any] = {}
+        github_arg = (args.get("github_url") or "").strip()
+        leetcode_arg = (args.get("leetcode_url") or "").strip()
+        profile_arg = (args.get("profile_url") or "").strip()
+        if (
+            github_arg
+            and verification.parse_username(github_arg, "github.com")
+            and github_arg != cand.get("github_url")
+        ):
+            updates["github_url"] = github_arg
+        if (
+            leetcode_arg
+            and verification.parse_username(leetcode_arg, "leetcode.com")
+            and leetcode_arg != cand.get("leetcode_url")
+        ):
+            updates["leetcode_url"] = leetcode_arg
+        if profile_arg and verification.profile_links.is_public_url(profile_arg):
+            kind = verification.profile_links.classify_url(profile_arg)
+            if kind == "github" and not updates.get("github_url"):
+                updates["github_url"] = profile_arg
+            elif kind == "leetcode" and not updates.get("leetcode_url"):
+                updates["leetcode_url"] = profile_arg
+            elif kind == "website" and profile_arg != cand.get("portfolio_url"):
+                updates["portfolio_url"] = profile_arg
+        if updates:
+            await session.execute(
+                sa.update(candidates)
+                .where(candidates.c.id == cand["id"])
+                .values(**updates, updated_at=utcnow())
+            )
+            await session.commit()
+            cand = {**cand, **updates}
+
+        # enrich=True: if GitHub/LeetCode are still missing, crawl the personal
+        # website once and mine GitHub/LeetCode/LinkedIn links from it.
+        v = await verification.verify_candidate(
+            cand, keywords=list(cand.get("skills") or []), enrich=True
+        )
         gh = v.get("github") or {}
         lc = v.get("leetcode") or {}
-        return {
+        website = v.get("website")
+        discovered = v.get("discovered") or {}
+
+        # Persist anything the crawl discovered so the dashboard and later runs
+        # keep the richer profile.
+        learned: dict[str, Any] = {
+            field: value
+            for field, value in (
+                ("github_url", discovered.get("github_url")),
+                ("leetcode_url", discovered.get("leetcode_url")),
+                ("linkedin_url", discovered.get("linkedin_url")),
+            )
+            if value and value != cand.get(field)
+        }
+        if learned:
+            await session.execute(
+                sa.update(candidates)
+                .where(candidates.c.id == cand["id"])
+                .values(**learned, updated_at=utcnow())
+            )
+            await session.commit()
+
+        result: dict[str, Any] = {
             "candidate_name": cand["full_name"],
             "evidence_score": v.get("evidence_score"),
             "signals": v.get("signals") or [],
             "github": {
                 "available": gh.get("available", False),
                 "reason": gh.get("reason"),
+                "profile_url": gh.get("profile_url") or gh.get("source_url"),
+                "username": gh.get("username"),
                 "public_repos": gh.get("public_repos"),
                 "relevant_repos": [r.get("name") for r in (gh.get("relevant_repositories") or [])[:5]],
+                "discovered_from": gh.get("discovered_from"),
             },
             "leetcode": {
                 "available": lc.get("available", False),
                 "reason": lc.get("reason"),
+                "profile_url": lc.get("profile_url") or lc.get("source_url"),
+                "username": lc.get("username"),
                 "ranking": lc.get("ranking"),
                 "total_solved": lc.get("total_solved"),
                 "solved_by_difficulty": lc.get("solved_by_difficulty") or {},
                 "contest_rating": lc.get("contest_rating"),
+                "discovered_from": lc.get("discovered_from"),
             },
         }
+        if website is not None:
+            result["website"] = {
+                "available": website.get("available", False),
+                "reason": website.get("reason"),
+                "url": website.get("final_url") or cand.get("portfolio_url"),
+                "title": website.get("title"),
+                "description": website.get("description"),
+                "discovered": discovered,
+                "links": {
+                    kind: (website.get("links") or {}).get(kind, [])[:5]
+                    for kind in ("github", "leetcode", "linkedin", "website")
+                },
+            }
+        return result
 
     elif name == "update_candidate_status":
         cand = await _resolve_candidate(session, workspace_id, args.get("candidate_name_or_id"))
