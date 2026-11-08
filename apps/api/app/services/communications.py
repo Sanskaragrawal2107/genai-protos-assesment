@@ -235,6 +235,10 @@ def _template(
         if link:
             body.append(f"Meeting Join Link: {link}")
             body.append("(Both interviewer/reviewer and candidate join directly using this link)")
+            body.append(
+                "Please join the meeting 5 minutes before the scheduled time to test your "
+                "audio and video."
+            )
         else:
             body.append(
                 "The video meeting link will follow in a separate email once the recruiter "
