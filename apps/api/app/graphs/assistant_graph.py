@@ -67,15 +67,6 @@ def _reply_chunks(text: str, *, words_per_chunk: int = 3) -> list[str]:
     return ["".join(words[i : i + words_per_chunk]) for i in range(0, len(words), words_per_chunk)]
 
 
-async def _stream_reply(reply: str) -> AsyncIterator[dict[str, Any]]:
-    chunks = _reply_chunks(reply)
-    delay = max(0.005, min(0.03, 0.6 / len(chunks))) if len(chunks) > 1 else 0.0
-    for chunk in chunks:
-        yield {"type": "token", "text": chunk}
-        if delay:
-            await asyncio.sleep(delay)
-
-
 # --------------------------------------------------------------------- OpenAI Tools
 AGENT_TOOLS = [
     {
