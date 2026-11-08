@@ -33,6 +33,7 @@ from ..repo import (
     candidate_summary,
     create_pending_action,
     list_candidates,
+    meeting_provider_for,
     normalize_meeting_provider,
     set_candidate_status,
     to_jsonable,
@@ -162,7 +163,7 @@ AGENT_TOOLS = [
                     "meeting_provider": {
                         "type": "string",
                         "enum": ["microsoft_teams", "google_meet"],
-                        "description": "Video meeting provider (defaults to microsoft_teams)",
+                        "description": "Video meeting provider. Defaults to the workspace's configured provider. Pass google_meet whenever the recruiter asks to use or switch to Google Meet.",
                     },
                     "title": {"type": "string", "description": "Title of the interview"},
                 },
@@ -328,6 +329,11 @@ CRITICAL INSTRUCTIONS & RECRUITER POLICIES:
          4. Clearly state that the reviewer/interviewer joins using this exact same meeting URL.
          5. Present the full drafted invitation email (Recipient, Subject, and Body) containing the join link, and confirm it is saved and queued for recruiter approval in the dashboard.
        - NEVER say "I can't create the live meeting link in this turn", "join link to be generated", or "placeholder". The tool creates and returns the live join link immediately!
+     - Provider switching (CRITICAL):
+       - If the recruiter says to switch providers — e.g. "switch to Google Meet", "go for Google Meet", "use Meet", "Google Meet please" — you MUST immediately call `schedule_interview` again for the SAME date/time with `meeting_provider="google_meet"`. Do NOT ask for confirmation again, do NOT keep retrying Microsoft Teams, and do NOT just list options in prose.
+       - If a `schedule_interview` attempt fails with a Microsoft Teams error (authentication, token, or not-connected), do NOT retry Teams in that same turn. Report the failure once and, when the recruiter has asked for Google Meet or agreed to it, call `schedule_interview` with `meeting_provider="google_meet"` immediately.
+       - Only ever report a join link that the tool actually returned. Never claim a Teams or Meet link was generated when the tool returned an error, and never invent a link or a calendar-invite placeholder.
+       - After switching, state clearly that the platform is now Google Meet and include the real join link returned by the tool.
 4. Technical Verification:
    - Use `verify_candidate` to look up LeetCode ratings, problem counts, and GitHub repositories.
    - If the recruiter provides a LeetCode or GitHub profile URL, pass it to `verify_candidate` as `leetcode_url` / `github_url`. Never report a profile as "not verified" when the recruiter just gave you a URL — call the tool with that URL first.
@@ -432,6 +438,27 @@ async def _hydrate_email_content(
 
 
 # --------------------------------------------------------------------- Tool Executors
+_MEET_SWITCH_RE = re.compile(r"google\s*meet|gmeet|meet\.google\.com", re.IGNORECASE)
+_TEAMS_SWITCH_RE = re.compile(r"microsoft\s*teams|ms\s*teams|\bteams\b", re.IGNORECASE)
+
+
+def provider_hint_from_message(message: str | None) -> str | None:
+    """Best-effort provider override from the recruiter's latest message.
+
+    Only used when the model omits ``meeting_provider``. Google Meet wins ties
+    because "Google Meet" also contains the word "meet" and a switch request is
+    almost always the reason the recruiter is talking about providers at all.
+    """
+    text = (message or "").strip()
+    if not text:
+        return None
+    if _MEET_SWITCH_RE.search(text):
+        return "google_meet"
+    if _TEAMS_SWITCH_RE.search(text):
+        return "microsoft_teams"
+    return None
+
+
 async def execute_tool_call(
     *,
     name: str,
@@ -569,7 +596,15 @@ async def execute_tool_call(
             return {"error": f"Could not parse '{time_str}'. Ask the recruiter for a specific date and time."}
 
         duration = int(args.get("duration_minutes") or 30)
-        provider = normalize_meeting_provider(args.get("meeting_provider"))
+        # An explicit provider from the recruiter always wins (this is what makes
+        # "switch to Google Meet" actually switch). When it is omitted we use the
+        # workspace setting instead of hard-coding Teams, so a workspace configured
+        # for Google Meet is never silently forced back onto Teams.
+        raw_provider = (args.get("meeting_provider") or "").strip()
+        if raw_provider:
+            provider = normalize_meeting_provider(raw_provider)
+        else:
+            provider = await meeting_provider_for(session, workspace_id)
         if provider == "none":
             provider = "microsoft_teams"
 
@@ -1035,6 +1070,15 @@ async def run_assistant_stream(
                     args = json.loads(raw_args)
                 except Exception:
                     args = {}
+
+                # Deterministic safety net: if the model forgot to pass a
+                # meeting provider on a scheduling call but the recruiter just
+                # told us to switch (e.g. "go for Google Meet"), honor it here
+                # instead of silently falling back to the workspace default.
+                if fn_name == "schedule_interview" and not (args.get("meeting_provider") or "").strip():
+                    hint = provider_hint_from_message(user_message)
+                    if hint:
+                        args["meeting_provider"] = hint
 
                 # Emit step start
                 arg_summary = ", ".join(f"{k}={v}" for k, v in list(args.items())[:2])

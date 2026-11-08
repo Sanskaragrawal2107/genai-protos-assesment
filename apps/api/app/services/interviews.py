@@ -331,7 +331,10 @@ async def execute_schedule(
     existing = (
         await session.execute(sa.select(interviews).where(interviews.c.idempotency_key == key))
     ).mappings().first()
-    if existing:
+    # Only short-circuit when the slot is already booked with the *same*
+    # provider. If the recruiter switched providers (e.g. Teams -> Google Meet)
+    # we must rebuild the meeting instead of handing back the stale link.
+    if existing and existing.get("provider") == provider:
         return {"status": "already_scheduled", "interview": dict(existing), "meeting_url": existing.get("meeting_url")}
 
     subject = payload.get("title") or f"Interview: {candidate.get('full_name') or 'Candidate'}"
@@ -382,34 +385,46 @@ async def execute_schedule(
         )
 
     invite_status = "queued" if candidate.get("email") else "no_candidate_email"
-    interview_id = uuid.uuid4().hex
     now = utcnow()
-    await session.execute(
-        sa.insert(interviews).values(
-            id=interview_id,
-            workspace_id=workspace_id,
-            candidate_id=candidate["id"],
-            recruiter_id=recruiter_id,
-            job_id=None,
-            provider=provider,
-            calendar_provider=meeting.calendar_provider if meeting else "none",
-            calendar_id=(meeting.calendar_id or "") if meeting else "",
-            calendar_event_id=meeting.calendar_event_id if meeting else None,
-            calendar_html_link=meeting.calendar_html_link if meeting else None,
-            meeting_id=meeting.meeting_id if meeting else None,
-            meeting_url=join_url,
-            start_time=start,
-            end_time=end,
-            timezone=timezone_name,
-            status="scheduled",
-            invite_status=invite_status,
-            attendees=[{"email": email} for email in (candidate.get("email"),) if email],
-            idempotency_key=key,
-            notes=payload.get("notes"),
-            created_at=now,
-            updated_at=now,
+    values = {
+        "provider": provider,
+        "calendar_provider": meeting.calendar_provider if meeting else "none",
+        "calendar_id": (meeting.calendar_id or "") if meeting else "",
+        "calendar_event_id": meeting.calendar_event_id if meeting else None,
+        "calendar_html_link": meeting.calendar_html_link if meeting else None,
+        "meeting_id": meeting.meeting_id if meeting else None,
+        "meeting_url": join_url,
+        "start_time": start,
+        "end_time": end,
+        "timezone": timezone_name,
+        "status": "scheduled",
+        "invite_status": invite_status,
+        "attendees": [{"email": email} for email in (candidate.get("email"),) if email],
+        "notes": payload.get("notes"),
+        "updated_at": now,
+    }
+    if existing:
+        # Provider switch on an already-booked slot: update the existing row in
+        # place so the idempotency key stays unique and downstream references
+        # (confirmation email, pending action) keep the same interview id.
+        interview_id = existing["id"]
+        await session.execute(
+            sa.update(interviews).where(interviews.c.id == interview_id).values(**values)
         )
-    )
+    else:
+        interview_id = uuid.uuid4().hex
+        await session.execute(
+            sa.insert(interviews).values(
+                id=interview_id,
+                workspace_id=workspace_id,
+                candidate_id=candidate["id"],
+                recruiter_id=recruiter_id,
+                job_id=None,
+                idempotency_key=key,
+                created_at=now,
+                **values,
+            )
+        )
     await session.commit()
 
     await set_candidate_status(

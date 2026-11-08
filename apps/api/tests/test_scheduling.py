@@ -46,6 +46,29 @@ def test_idempotency_key_is_stable():
     assert a != c
 
 
+def test_normalize_meeting_provider_aliases():
+    from app.repo import normalize_meeting_provider
+
+    assert normalize_meeting_provider("google_meet") == "google_meet"
+    assert normalize_meeting_provider("Google Meet") == "google_meet"
+    assert normalize_meeting_provider("google meet") == "google_meet"
+    assert normalize_meeting_provider("meet") == "google_meet"
+    assert normalize_meeting_provider("teams") == "microsoft_teams"
+    assert normalize_meeting_provider(None) == "microsoft_teams"
+
+
+def test_provider_hint_from_message():
+    from app.graphs.assistant_graph import provider_hint_from_message
+
+    assert provider_hint_from_message("go for Google Meet") == "google_meet"
+    assert provider_hint_from_message("Okay switch to Google Meet.") == "google_meet"
+    assert provider_hint_from_message("switch to gmeet please") == "google_meet"
+    assert provider_hint_from_message("use Microsoft Teams instead") == "microsoft_teams"
+    assert provider_hint_from_message("schedule it for 3pm tomorrow") is None
+    assert provider_hint_from_message(None) is None
+    assert provider_hint_from_message("") is None
+
+
 async def test_availability_detects_local_conflicts(db, workspace):
     candidate = await _candidate(db, workspace["workspace_id"])
     start = (utcnow() + timedelta(days=1)).replace(minute=0, second=0, microsecond=0)
@@ -349,3 +372,76 @@ async def test_schedule_is_idempotent_on_teams_external_id(db, workspace, monkey
     assert second["status"] == "already_scheduled"
     assert len(seen) == 1  # no duplicate Teams meeting
     assert len((await db.execute(sa.select(interviews))).mappings().all()) == 1
+
+
+async def test_provider_switch_rebuilds_meeting_in_place(db, workspace, monkeypatch):
+    """Switching providers for a slot that is already booked must replace the
+    meeting link instead of returning the stale one off the idempotency key."""
+    await _connect_teams(db, workspace["workspace_id"])
+    now = utcnow()
+    await db.execute(
+        sa.insert(connected_accounts).values(
+            id=db_module.new_id(),
+            workspace_id=workspace["workspace_id"],
+            recruiter_id="tester",
+            provider="google_calendar",
+            composio_connected_account_id="ca_google",
+            composio_user_id="airecruiter:" + workspace["workspace_id"],
+            connected_email="recruiting@example.com",
+            status="active",
+            scopes=[],
+            created_at=now,
+            updated_at=now,
+        )
+    )
+    await db.commit()
+
+    candidate = await _candidate(db, workspace["workspace_id"])
+    start = (utcnow() + timedelta(days=5)).replace(minute=0, second=0, microsecond=0)
+    key = _idempotency_key(workspace["workspace_id"], candidate["id"], start, "tester")
+
+    async def fake_execute(slug: str, *, user_id: str, arguments: dict, connected_account_id=None):
+        if slug == "GOOGLECALENDAR_CREATE_EVENT":
+            return {
+                "id": "evt-google-1",
+                "htmlLink": "https://calendar.google.com/event?eid=evt-google-1",
+                "hangoutLink": "https://meet.google.com/abc-defg-hij",
+                "summary": arguments.get("summary"),
+            }
+        return {"id": "meeting-xyz", "joinWebUrl": "https://teams.microsoft.com/l/meetup-join/xyz"}
+
+    monkeypatch.setattr("app.services.calendar.composio.execute", fake_execute)
+
+    base = {
+        "candidate_id": candidate["id"],
+        "start": start.isoformat(),
+        "duration_minutes": 30,
+        "timezone": "Asia/Kolkata",
+        "idempotency_key": key,
+    }
+
+    first = await execute_schedule(
+        db,
+        workspace_id=workspace["workspace_id"],
+        recruiter_id="tester",
+        payload={**base, "provider": "microsoft_teams"},
+    )
+    assert first["status"] == "scheduled"
+    assert first["provider"] == "microsoft_teams"
+    assert "teams.microsoft.com" in first["meeting_url"]
+
+    switched = await execute_schedule(
+        db,
+        workspace_id=workspace["workspace_id"],
+        recruiter_id="tester",
+        payload={**base, "provider": "google_meet"},
+    )
+    assert switched["status"] == "scheduled"
+    assert switched["provider"] == "google_meet"
+    assert switched["meeting_url"] == "https://meet.google.com/abc-defg-hij"
+
+    rows = (await db.execute(sa.select(interviews))).mappings().all()
+    assert len(rows) == 1  # updated in place, not duplicated
+    assert rows[0]["id"] == switched["interview_id"] == first["interview_id"]
+    assert rows[0]["provider"] == "google_meet"
+    assert rows[0]["meeting_url"] == "https://meet.google.com/abc-defg-hij"
