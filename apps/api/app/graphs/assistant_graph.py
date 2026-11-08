@@ -943,10 +943,29 @@ async def execute_tool_call(
 # --------------------------------------------------------------------- Agent (Composio + LangChain)
 COMPOSIO_TOOLKITS = ["gmail", "googlecalendar", "googlemeet", "microsoft_teams", "github"]
 
-# Cache the session's LangChain tools per workspace. Session creation does a
-# network round-trip, so we keep it warm for the same 25 minutes the MCP path
-# uses. The tools close over the session, so caching the tools keeps it alive.
-_COMPOSIO_TOOL_CACHE: dict[str, tuple[float, list[Any]]] = {}
+# Pretty names for the "connect this app" prompt in the chat UI.
+TOOLKIT_NAMES: dict[str, str] = {
+    "gmail": "Gmail",
+    "github": "GitHub",
+    "googlecalendar": "Google Calendar",
+    "googlemeet": "Google Meet",
+    "microsoft_teams": "Microsoft Teams",
+}
+
+
+def _toolkit_name(slug: str) -> str:
+    return TOOLKIT_NAMES.get(slug, slug.replace("_", " ").title())
+
+
+def _toolkit_logo(slug: str) -> str:
+    # Public Composio logo endpoint (no auth required), stable per toolkit slug.
+    return f"https://logos.composio.dev/api/{slug}"
+
+
+# Cache the session *and* its LangChain tools per workspace. Session creation is
+# a network round-trip, so we keep it warm for the same 25 minutes the MCP path
+# uses. The session is needed to read connection status; the tools close over it.
+_COMPOSIO_CACHE: dict[str, tuple[float, Any, list[Any]]] = {}
 
 _COMPOSIO_LABELS: dict[str, tuple[str, str]] = {
     "COMPOSIO_SEARCH_TOOLS": ("composio", "Finding the right app tool"),
@@ -962,8 +981,8 @@ def _composio_user_id(workspace_id: str) -> str:
     return f"{settings.composio_user_prefix}:{workspace_id}"
 
 
-def _load_composio_tools(workspace_id: str) -> list[Any]:
-    """Blocking: create a Composio session and return its LangChain tools.
+def _load_composio_session(workspace_id: str) -> tuple[Any, list[Any]]:
+    """Blocking: create a Composio session and return ``(session, tools)``.
 
     Exactly the pattern from the Composio LangChain docs:
 
@@ -973,7 +992,7 @@ def _load_composio_tools(workspace_id: str) -> list[Any]:
     there is no per-toolkit boilerplate to maintain.
     """
     if not settings.composio_enabled:
-        return []
+        return None, []
     kwargs: dict[str, Any] = {
         "api_key": settings.composio_api_key,
         "provider": LangchainProvider(),
@@ -984,20 +1003,83 @@ def _load_composio_tools(workspace_id: str) -> list[Any]:
         user_id=_composio_user_id(workspace_id),
         toolkits=COMPOSIO_TOOLKITS,
     )
-    return list(session.tools())
+    return session, list(session.tools())
 
 
-async def _composio_tools(workspace_id: str) -> list[Any]:
-    cached = _COMPOSIO_TOOL_CACHE.get(workspace_id)
+async def _composio(workspace_id: str) -> tuple[Any | None, list[Any]]:
+    cached = _COMPOSIO_CACHE.get(workspace_id)
     if cached and (time.time() - cached[0]) < 25 * 60:
-        return cached[1]
+        return cached[1], cached[2]
     try:
-        tools = await asyncio.to_thread(_load_composio_tools, workspace_id)
+        session, tools = await asyncio.to_thread(_load_composio_session, workspace_id)
     except Exception as exc:  # noqa: BLE001 - never block a chat turn on Composio
         log.warning("composio session unavailable: %s", exc)
+        return None, []
+    _COMPOSIO_CACHE[workspace_id] = (time.time(), session, tools)
+    return session, tools
+
+
+def _connection_status(session: Any) -> tuple[list[str], list[dict[str, Any]]]:
+    """Blocking: read Composio connection state for the session's toolkits.
+
+    Returns ``(connected_slugs, missing)`` where each missing entry is a
+    ``{"slug", "name", "logo"}`` dict ready for the frontend prompt.
+    """
+    try:
+        details = session.toolkits()
+        items = getattr(details, "items", None) or []
+    except Exception as exc:  # noqa: BLE001 - status is best-effort
+        log.warning("composio toolkit status unavailable: %s", exc)
+        return [], []
+    connected: list[str] = []
+    missing: list[dict[str, Any]] = []
+    for item in items:
+        slug = getattr(item, "slug", None)
+        if not slug:
+            continue
+        active = bool(getattr(getattr(item, "connection", None), "is_active", False))
+        if active:
+            connected.append(slug)
+        else:
+            missing.append({"slug": slug, "name": _toolkit_name(slug), "logo": _toolkit_logo(slug)})
+    return connected, missing
+
+
+def _connect_links_from(output: Any) -> list[dict[str, Any]]:
+    """Extract ``{toolkit, name, logo, url}`` from a COMPOSIO_MANAGE_CONNECTIONS result.
+
+    Composio returns::
+
+        {"data": {"results": {"github": {"toolkit": "github",
+                                          "status": "initiated",
+                                          "redirect_url": "https://connect..."}}}}
+
+    We only surface entries that actually carry a ``redirect_url``.
+    """
+    raw = getattr(output, "content", None)
+    if raw is None:
+        raw = output
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except Exception:  # noqa: BLE001 - not JSON, nothing to surface
+            return []
+    if not isinstance(raw, dict):
         return []
-    _COMPOSIO_TOOL_CACHE[workspace_id] = (time.time(), tools)
-    return tools
+    results = (raw.get("data") or {}).get("results")
+    links: list[dict[str, Any]] = []
+    if isinstance(results, dict):
+        for slug, info in results.items():
+            if isinstance(info, dict) and info.get("redirect_url"):
+                links.append(
+                    {
+                        "toolkit": slug,
+                        "name": _toolkit_name(slug),
+                        "logo": _toolkit_logo(slug),
+                        "url": info["redirect_url"],
+                    }
+                )
+    return links
 
 
 def _domain_tools(
@@ -1055,14 +1137,14 @@ def _domain_tools(
     return tools
 
 
-def _build_agent(tools: list[Any]) -> Any:
+def _build_agent(tools: list[Any], *, system_prompt: str = SYSTEM_PROMPT) -> Any:
     model = ChatOpenAI(
         model=settings.llm_model,
         api_key=settings.openai_api_key,
         base_url=settings.openai_base_url,
         temperature=settings.llm_temperature,
     )
-    return create_agent(model=model, tools=tools, system_prompt=SYSTEM_PROMPT)
+    return create_agent(model=model, tools=tools, system_prompt=system_prompt)
 
 
 # --------------------------------------------------------------------- Streaming Turn Runner
@@ -1131,6 +1213,8 @@ async def run_assistant_stream(
 
     accumulated_candidates: list[dict[str, Any]] = []
     accumulated_pending: list[dict[str, Any]] = []
+    accumulated_connections: list[dict[str, Any]] = []
+    seen_connections: set[str] = set()
     final_reply: str = ""
 
     # Step indicator for the agent turn
@@ -1144,7 +1228,23 @@ async def run_assistant_stream(
     }
 
     try:
-        composio_tools = await _composio_tools(workspace_id)
+        composio_session, composio_tools = await _composio(workspace_id)
+        system_prompt = SYSTEM_PROMPT
+        if composio_session is not None:
+            connected, missing = await asyncio.to_thread(_connection_status, composio_session)
+            if missing:
+                missing_names = ", ".join(item["name"] for item in missing)
+                system_prompt = (
+                    SYSTEM_PROMPT
+                    + "\n\nAPP CONNECTIONS (Composio):\n"
+                    + f"- Connected: {', '.join(_toolkit_name(s) for s in connected) or 'none'}\n"
+                    + f"- Not connected: {missing_names}\n"
+                    + "If the recruiter's request needs a not-connected app, call "
+                    + "`COMPOSIO_MANAGE_CONNECTIONS` with that app's toolkit slug, then tell the "
+                    + "recruiter to click the connect link to finish. Never claim a not-connected "
+                    + "app action succeeded."
+                )
+
         tools = _domain_tools(
             session=session,
             workspace_id=workspace_id,
@@ -1153,7 +1253,7 @@ async def run_assistant_stream(
             accumulated_candidates=accumulated_candidates,
             accumulated_pending=accumulated_pending,
         ) + composio_tools
-        agent = _build_agent(tools)
+        agent = _build_agent(tools, system_prompt=system_prompt)
 
         # ``messages`` still starts with the system prompt; create_agent owns it.
         lc_messages = [
@@ -1248,6 +1348,16 @@ async def run_assistant_stream(
                     "ms": elapsed_ms,
                 }
 
+                # Composio initiated an app connection: surface a "connect this
+                # app" prompt in the chat UI instead of leaving it in prose.
+                if name == "COMPOSIO_MANAGE_CONNECTIONS":
+                    for link in _connect_links_from(output):
+                        if link["toolkit"] in seen_connections:
+                            continue
+                        seen_connections.add(link["toolkit"])
+                        accumulated_connections.append(link)
+                        yield {"type": "connect", **link}
+
         if not final_reply:
             final_reply = "I processed your request."
 
@@ -1270,6 +1380,7 @@ async def run_assistant_stream(
         "data": {},
         "candidates": accumulated_candidates,
         "pending_actions": accumulated_pending,
+        "connections": accumulated_connections,
     })
 
     await session.execute(
@@ -1295,6 +1406,7 @@ async def run_assistant_stream(
         "reply": final_reply,
         "candidates": accumulated_candidates,
         "pending_actions": accumulated_pending,
+        "connections": accumulated_connections,
     }
 
 

@@ -16,6 +16,7 @@ import {
   MessageSquare,
   PanelLeftClose,
   PanelLeftOpen,
+  Plug,
   Plus,
   Search,
   Square,
@@ -25,7 +26,7 @@ import {
 } from "lucide-react";
 import { api, apiStream, ApiError } from "@/lib/api";
 import { humanize, timeFromNow } from "@/lib/format";
-import type { CandidateSummary, ChatPayload, PendingAction } from "@/lib/types";
+import type { CandidateSummary, ChatPayload, PendingAction, AppConnection } from "@/lib/types";
 import { PendingActions } from "@/components/PendingActions";
 import { MarkdownMessage } from "@/components/MarkdownMessage";
 import { Alert, Avatar, Spinner } from "@/components/ui";
@@ -60,6 +61,7 @@ interface Turn {
   text: string;
   candidates?: AssistantCandidate[];
   pending?: PendingAction[];
+  connections?: AppConnection[];
   intent?: string;
   data?: Record<string, unknown>;
   error?: string;
@@ -83,6 +85,7 @@ interface ThreadMessage {
     data?: Record<string, unknown>;
     candidates?: AssistantCandidate[];
     pending_actions?: PendingAction[];
+    connections?: AppConnection[];
   } | null;
   created_at?: string;
 }
@@ -213,6 +216,7 @@ function AssistantInner() {
             intent: message.payload?.intent,
             candidates: message.payload?.candidates,
             pending: message.payload?.pending_actions,
+            connections: message.payload?.connections,
             data: message.payload?.data,
           })),
         );
@@ -333,6 +337,24 @@ function AssistantInner() {
             if (chunk) patch((turn) => ({ ...turn, text: turn.text + chunk }));
             return;
           }
+          if (event === "connect") {
+            const connection = data as AppConnection;
+            if (connection?.url && connection?.toolkit) {
+              patch((turn) => {
+                const existing = turn.connections ?? [];
+                const already = existing.some((item) => item.toolkit === connection.toolkit);
+                return {
+                  ...turn,
+                  connections: already
+                    ? existing.map((item) =>
+                        item.toolkit === connection.toolkit ? { ...item, ...connection } : item,
+                      )
+                    : [...existing, connection],
+                };
+              });
+            }
+            return;
+          }
           if (event === "done") {
             const payload = data as ChatPayload;
             if (payload.thread_id) {
@@ -346,6 +368,7 @@ function AssistantInner() {
               text: payload.reply || payload.message || turn.text,
               candidates: payload.candidates,
               pending: payload.pending_actions,
+              connections: payload.connections?.length ? payload.connections : turn.connections,
               intent: payload.intent,
               data: payload.data,
             }));
@@ -670,6 +693,14 @@ function AssistantInner() {
 
                     {turn.error ? <Alert tone="error">{turn.error}</Alert> : null}
 
+                    {turn.connections && turn.connections.length > 0 ? (
+                      <div className="space-y-2 pt-1">
+                        {turn.connections.map((connection) => (
+                          <ConnectionCard key={connection.toolkit} connection={connection} />
+                        ))}
+                      </div>
+                    ) : null}
+
                     {turn.candidates && turn.candidates.length > 0 ? (
                       <div className="pt-1">
                         <p className="mb-2 text-[10.5px] font-semibold uppercase tracking-[0.07em] text-[#a1a1aa]">
@@ -902,6 +933,38 @@ function ToolExecutionAccordion({ steps }: { steps: Step[] }) {
           ))}
         </div>
       ) : null}
+    </div>
+  );
+}
+
+function ConnectionCard({ connection }: { connection: AppConnection }) {
+  const name = connection.name || connection.toolkit;
+  return (
+    <div className="flex items-center gap-3 rounded-[9px] border border-[#d7e3ee] bg-[#f4f8fc] p-3">
+      <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-[7px] border border-[#e2ebf4] bg-white">
+        {connection.logo ? (
+          // eslint-disable-next-line @next/next/no-img-element
+          <img src={connection.logo} alt={`${name} logo`} width={18} height={18} />
+        ) : (
+          <Plug size={15} className="text-[#3f6d57]" />
+        )}
+      </span>
+      <div className="min-w-0 flex-1">
+        <p className="text-[12px] font-medium text-[#18181b]">Please connect your {name}</p>
+        <p className="mt-0.5 text-[11px] leading-5 text-[#71717a]">
+          Authorize {name} once and the assistant can use it automatically. The link expires in 10
+          minutes.
+        </p>
+      </div>
+      <a
+        href={connection.url}
+        target="_blank"
+        rel="noopener noreferrer"
+        className="inline-flex shrink-0 items-center gap-1 rounded-[6px] bg-[#1f4b3f] px-2.5 py-1.5 text-[11.5px] font-medium text-white transition-colors hover:bg-[#173a30]"
+      >
+        Connect
+        <ArrowRight size={12} />
+      </a>
     </div>
   );
 }

@@ -293,6 +293,13 @@ export interface SyncSettingsResponse {
   };
 }
 
+export interface AppConnection {
+  toolkit: string;
+  name?: string;
+  logo?: string;
+  url: string;
+}
+
 export interface ChatPayload {
   thread_id: string;
   intent: string;
@@ -301,4 +308,5 @@ export interface ChatPayload {
   data: Record<string, unknown>;
   candidates: CandidateSummary[];
   pending_actions: PendingAction[];
+  connections?: AppConnection[];
 }
