@@ -1,0 +1,26 @@
+node_modules/
+.next/
+out/
+dist/
+build/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.tsbuildinfo
+
+# secrets
+.env
+.env.local
+.env.*.local
+
+# misc
+.DS_Store
+*.log
+coverage/
+
+# local tool state / temp backups (not part of the project)
+.freebuff/
+.tmp-ui-backup/
+supabase/.temp/

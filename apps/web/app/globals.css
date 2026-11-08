@@ -1,0 +1,272 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Segoe UI Variable Display", "Segoe UI", -apple-system, BlinkMacSystemFont,
+    "Helvetica Neue", Arial, sans-serif;
+  --font-mono: "Cascadia Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+
+  --color-ink: #18181b;
+  --color-muted: #71717a;
+  --color-subtle: #a1a1aa;
+  --color-line: #e4e4e7;
+  --color-line-strong: #d4d4d8;
+  --color-canvas: #fbfbfa;
+  --color-accent: #1f4b3f;
+  --color-accent-hover: #163a31;
+  --color-accent-soft: #eef3f0;
+  --color-accent-line: #cfded7;
+}
+
+:root {
+  color-scheme: light;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  background-color: #ffffff;
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  letter-spacing: -0.006em;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+::selection {
+  background: #dfe9e4;
+  color: #14332b;
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #d6d6d3 transparent;
+}
+
+:focus-visible {
+  outline: 2px solid #1f4b3f;
+  outline-offset: 2px;
+}
+
+/* Text fields show focus through their own border/ring, never the global outline. */
+textarea:focus-visible,
+select:focus-visible,
+input:not([type="checkbox"]):not([type="radio"]):focus-visible {
+  outline: none;
+  outline-offset: 0;
+}
+
+@utility btn {
+  @apply inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-[7px] px-3 py-1.5
+    text-[13px] font-medium leading-5 transition-colors duration-150
+    disabled:pointer-events-none disabled:opacity-45;
+}
+
+@utility badge {
+  @apply inline-flex items-center gap-1.5 rounded-[5px] border px-1.5 py-0.5
+    text-[11px] font-medium leading-4 whitespace-nowrap;
+}
+
+@utility input {
+  @apply w-full rounded-[7px] border border-[#e4e4e7] bg-white px-3 py-2 text-[13px] text-[#18181b]
+    placeholder:text-[#a1a1aa] transition-colors
+    focus:border-[#1f4b3f] focus:ring-2 focus:ring-[#1f4b3f]/10 focus:outline-none;
+}
+
+@layer components {
+  /* ------------------------------------------------------------- surfaces */
+  .card {
+    @apply rounded-[10px] border border-[#e7e7e4] bg-white;
+    box-shadow: 0 1px 2px rgba(24, 24, 27, 0.035);
+  }
+
+  .card-hd {
+    @apply flex items-start justify-between gap-3 border-b border-[#f0f0ed] px-5 py-3.5;
+  }
+
+  .card-title {
+    @apply text-[13.5px] font-semibold tracking-[-0.01em] text-[#18181b];
+  }
+
+  .card-sub {
+    @apply text-[12px] font-normal leading-5 text-[#8a8a93];
+  }
+
+  .panel {
+    @apply rounded-[10px] border border-[#e7e7e4] bg-white;
+    box-shadow: 0 1px 2px rgba(24, 24, 27, 0.035);
+  }
+
+  /* ---------------------------------------------------------------- chrome */
+  .sidebar-link {
+    @apply flex items-center gap-2.5 rounded-[7px] px-2.5 py-[7px] text-[13px]
+      font-medium text-[#5c5c66] transition-colors duration-150
+      hover:bg-[#f4f4f1] hover:text-[#18181b];
+  }
+
+  .sidebar-link-active {
+    @apply bg-[#eef3f0] font-semibold text-[#14332b] hover:bg-[#eef3f0] hover:text-[#14332b];
+  }
+
+  .topbar-link {
+    @apply inline-flex items-center gap-1.5 rounded-[7px] px-2.5 py-1.5 text-[12.5px]
+      font-medium text-[#5c5c66] transition-colors hover:bg-[#f4f4f1] hover:text-[#18181b];
+  }
+
+  /* --------------------------------------------------------------- typography */
+  .page-title {
+    @apply text-[22px] font-semibold leading-7 tracking-[-0.022em] text-[#18181b];
+  }
+
+  .page-sub {
+    @apply mt-1 text-[13px] leading-5 text-[#71717a];
+  }
+
+  .eyebrow {
+    @apply text-[10.5px] font-semibold uppercase leading-4 tracking-[0.08em] text-[#8a8a93];
+  }
+
+  .section-title {
+    @apply text-[15px] font-semibold tracking-[-0.01em] text-[#18181b];
+  }
+
+  .meta {
+    @apply text-[11.5px] leading-4 text-[#8a8a93];
+  }
+
+  .link {
+    @apply font-medium text-[#1f4b3f] underline-offset-2 hover:underline;
+  }
+
+  /* ---------------------------------------------------------------- buttons */
+  .btn-primary {
+    @apply btn bg-[#1f4b3f] text-white hover:bg-[#163a31] active:bg-[#112f27];
+    box-shadow: 0 1px 1px rgba(24, 24, 27, 0.08);
+  }
+
+  .btn-secondary {
+    @apply btn border border-[#e4e4e7] bg-white text-[#3f3f46];
+    box-shadow: 0 1px 1px rgba(24, 24, 27, 0.03);
+  }
+
+  .btn-secondary:hover {
+    @apply border-[#d4d4d8] bg-[#fafaf9] text-[#18181b];
+  }
+
+  .btn-ghost {
+    @apply btn text-[#5c5c66] hover:bg-[#f4f4f1] hover:text-[#18181b];
+  }
+
+  .btn-danger {
+    @apply btn border border-[#f3d3d0] bg-white text-[#a63a2c] hover:bg-[#fdf4f2];
+  }
+
+  .btn-sm {
+    @apply rounded-[6px] px-2 py-1 text-[12px];
+  }
+
+  .textarea {
+    @apply input min-h-[110px] resize-y leading-relaxed;
+  }
+
+  .label {
+    @apply mb-1.5 block text-[12px] font-medium text-[#3f3f46];
+  }
+
+  .hint {
+    @apply mt-1 text-[11.5px] leading-4 text-[#8a8a93];
+  }
+
+  /* ----------------------------------------------------------------- badges */
+  .badge-slate {
+    @apply badge border-[#e7e7e4] bg-[#fafaf9] text-[#52525b];
+  }
+
+  .badge-indigo {
+    @apply badge border-[#d9e4de] bg-[#eef3f0] text-[#1f4b3f];
+  }
+
+  .badge-green {
+    @apply badge border-[#cfe4d6] bg-[#f1f8f3] text-[#17683a];
+  }
+
+  .badge-amber {
+    @apply badge border-[#f0e0bf] bg-[#fdf8ec] text-[#8a5a13];
+  }
+
+  .badge-rose {
+    @apply badge border-[#f1d5d2] bg-[#fdf4f2] text-[#a33a2c];
+  }
+
+  .chip {
+    @apply inline-flex items-center rounded-[4px] border border-[#ebebe8] bg-[#fafaf9]
+      px-1.5 py-0.5 text-[11px] font-medium leading-4 text-[#5c5c66];
+  }
+
+  .kbd {
+    @apply inline-flex h-5 min-w-5 items-center justify-center rounded-[4px] border border-[#e4e4e7]
+      bg-white px-1 font-sans text-[10px] font-medium text-[#8a8a93];
+    box-shadow: 0 1px 0 #e4e4e7;
+  }
+
+  /* ----------------------------------------------------------------- tables */
+  .table-wrap {
+    @apply w-full overflow-x-auto;
+  }
+
+  .table {
+    @apply w-full min-w-full border-collapse text-left text-[13px];
+  }
+
+  .table thead th {
+    @apply whitespace-nowrap border-b border-[#ececea] bg-[#fcfcfb] px-4 py-2.5
+      text-[10.5px] font-semibold uppercase tracking-[0.06em] text-[#8a8a93];
+  }
+
+  .table tbody td {
+    @apply border-b border-[#f2f2ef] px-4 py-[11px] align-middle text-[#3f3f46];
+  }
+
+  .table tbody tr:last-child td {
+    @apply border-b-0;
+  }
+
+  .table tbody tr {
+    @apply transition-colors;
+  }
+
+  .table tbody tr:hover {
+    @apply bg-[#fbfbfa];
+  }
+
+  /* ------------------------------------------------------------------ stats */
+  .stat-value {
+    @apply text-[26px] font-semibold leading-8 tracking-[-0.03em] text-[#18181b];
+    font-variant-numeric: tabular-nums;
+  }
+
+  .stat-label {
+    @apply text-[11.5px] font-medium leading-4 text-[#71717a];
+  }
+
+  /* ------------------------------------------------------------------ misc */
+  .skeleton {
+    @apply animate-pulse rounded-[6px] bg-[#f4f4f1];
+  }
+
+  .alert {
+    @apply rounded-[8px] border px-3.5 py-2.5 text-[12.5px] leading-5;
+  }
+
+  .divider {
+    @apply border-t border-[#f0f0ed];
+  }
+
+  .empty {
+    @apply flex flex-col items-center justify-center gap-2 px-6 py-12 text-center;
+  }
+}

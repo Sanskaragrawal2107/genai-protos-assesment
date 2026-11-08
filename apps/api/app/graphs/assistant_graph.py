@@ -1,0 +1,1046 @@
+"""Production Conversational AI Recruiter Assistant with OpenAI Tool Calling (gpt-5-nano).
+
+Replaces rigid, deterministic branching with full multi-turn conversational reasoning,
+thread history awareness, and direct function-calling against workspace tools.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import re
+import time
+from datetime import timezone
+from zoneinfo import ZoneInfo
+from typing import Any, AsyncIterator
+
+import sqlalchemy as sa
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from .. import db as db_module
+from ..composio import IntegrationError
+from ..config import settings
+from ..http import get_client
+from ..db import (
+    candidate_communications,
+    candidates,
+    chat_messages,
+    chat_threads,
+    pending_actions,
+    utcnow,
+)
+from ..repo import (
+    candidate_summary,
+    create_pending_action,
+    list_candidates,
+    normalize_meeting_provider,
+    set_candidate_status,
+    to_jsonable,
+)
+from ..services import assistant as svc
+from ..services import communications as comms
+from ..services import interviews as interview_svc
+from ..services import verification
+from ..services.interviews import upcoming_interviews
+
+log = logging.getLogger("recruiter.assistant_agent")
+
+_TOKEN_RE = re.compile(r"\S+\s*")
+
+
+def _reply_chunks(text: str, *, words_per_chunk: int = 3) -> list[str]:
+    words = _TOKEN_RE.findall(text)
+    if not words:
+        return [text] if text else []
+    return ["".join(words[i : i + words_per_chunk]) for i in range(0, len(words), words_per_chunk)]
+
+
+async def _stream_reply(reply: str) -> AsyncIterator[dict[str, Any]]:
+    chunks = _reply_chunks(reply)
+    delay = max(0.005, min(0.03, 0.6 / len(chunks))) if len(chunks) > 1 else 0.0
+    for chunk in chunks:
+        yield {"type": "token", "text": chunk}
+        if delay:
+            await asyncio.sleep(delay)
+
+
+# --------------------------------------------------------------------- OpenAI Tools
+AGENT_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search_candidates",
+            "description": "Search candidates from the workspace database matching roles, skills, experience, or keywords.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Job title or search keywords, e.g. 'AI Engineer', 'Python developer', 'LangGraph'",
+                    },
+                    "skills": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Required skills list, e.g. ['python', 'langgraph', 'fastapi']",
+                    },
+                    "location": {"type": "string", "description": "Candidate location filter"},
+                    "min_experience_years": {"type": "number", "description": "Minimum years of experience"},
+                    "status": {"type": "string", "description": "Pipeline status (APPLIED, SCREENED, SHORTLISTED, etc.)"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_candidate_profile",
+            "description": "Retrieve the full profile, resume summary, contact info, and notes for a specific candidate.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "candidate_name_or_id": {"type": "string", "description": "Candidate full name or UUID"},
+                },
+                "required": ["candidate_name_or_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "draft_candidate_email",
+            "description": (
+                "Draft an email to a candidate (shortlist notification, interview invitation, follow-up, "
+                "rejection, or custom update). Saves the draft in candidate_communications and queues a pending action "
+                "for the recruiter to approve before sending via Gmail."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "candidate_name_or_id": {
+                        "type": "string",
+                        "description": "Candidate full name or UUID. Deduce from conversation context if not explicitly mentioned.",
+                    },
+                    "email_type": {
+                        "type": "string",
+                        "enum": ["shortlist", "interview_invite", "follow_up", "rejection", "custom"],
+                        "description": "Category of the email",
+                    },
+                    "subject": {"type": "string", "description": "Clear, professional email subject line"},
+                    "body": {"type": "string", "description": "The complete email body text"},
+                    "company_name": {"type": "string", "description": "Company name to sign the email with, if provided by the recruiter"},
+                    "interviewer_name": {"type": "string", "description": "Interviewer or host name for the email, if provided by the recruiter"},
+                    "omit_contact_info": {"type": "boolean", "description": "Set true if recruiter requested omitting phone/email in signoff"},
+                },
+                "required": ["subject", "body"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "schedule_interview",
+            "description": (
+                "Propose or schedule an interview meeting. Supports Microsoft Teams and Google Meet / Calendar. "
+                "Creates the real meeting join link, schedules the calendar invite, drafts the invitation email, "
+                "and queues it as a pending action for recruiter approval."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "candidate_name_or_id": {
+                        "type": "string",
+                        "description": "Candidate full name or UUID. Deduce from conversation history if not specified.",
+                    },
+                    "time_expression": {
+                        "type": "string",
+                        "description": "Date and time in natural language (e.g. '12th of November at 4 pm', 'tomorrow at 3pm')",
+                    },
+                    "duration_minutes": {
+                        "type": "integer",
+                        "description": "Interview duration in minutes (default 30)",
+                    },
+                    "meeting_provider": {
+                        "type": "string",
+                        "enum": ["microsoft_teams", "google_meet"],
+                        "description": "Video meeting provider (defaults to microsoft_teams)",
+                    },
+                    "title": {"type": "string", "description": "Title of the interview"},
+                },
+                "required": ["time_expression"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "verify_candidate",
+            "description": (
+                "Verify candidate technical credentials: uses LeetCode FastMCP for problem rankings, ratings, and solved count, "
+                "and checks GitHub repositories."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "candidate_name_or_id": {"type": "string", "description": "Candidate name or UUID"},
+                },
+                "required": ["candidate_name_or_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_candidate_status",
+            "description": "Move a candidate to a new recruitment pipeline stage.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "candidate_name_or_id": {"type": "string", "description": "Candidate full name or UUID"},
+                    "status": {
+                        "type": "string",
+                        "enum": ["APPLIED", "SCREENED", "SHORTLISTED", "INTERVIEWING", "OFFERED", "REJECTED", "ON_HOLD"],
+                        "description": "Target pipeline stage",
+                    },
+                },
+                "required": ["candidate_name_or_id", "status"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_interviews",
+            "description": "Check the calendar for upcoming interviews.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "time_expression": {"type": "string", "description": "Filter window e.g. 'tomorrow' or null for all"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_pipeline_summary",
+            "description": "Get current recruitment pipeline totals and metrics.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "approve_and_send_email",
+            "description": (
+                "Approve and immediately send the drafted email or interview confirmation to the candidate "
+                "via the connected Gmail account. Call this whenever the recruiter says 'send it', 'send the mail', "
+                "'approve and send', 'no send it for now', 'yes send it', 'go ahead and send', or confirms to dispatch the email."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "candidate_name_or_id": {
+                        "type": "string",
+                        "description": "Candidate full name or UUID. Deduce from conversation context if omitted.",
+                    },
+                    "action_id": {
+                        "type": "string",
+                        "description": "Optional pending action ID to approve and send.",
+                    },
+                    "company_name": {
+                        "type": "string",
+                        "description": "Optional company name to use in the email signature, if the recruiter provided one.",
+                    },
+                    "interviewer_name": {
+                        "type": "string",
+                        "description": "Optional interviewer or host name to use in the email, if the recruiter provided one.",
+                    },
+                    "omit_contact_info": {
+                        "type": "boolean",
+                        "description": "Set true if recruiter requested omitting phone/email in signoff",
+                    },
+                },
+            },
+        },
+    },
+]
+
+TOOL_METADATA: dict[str, dict[str, str]] = {
+    "search_candidates": {"label": "Searching talent database", "tool": "search_candidates"},
+    "get_candidate_profile": {"label": "Loading candidate dossier", "tool": "candidate_profile"},
+    "draft_candidate_email": {"label": "Drafting outbound communication", "tool": "draft_email"},
+    "schedule_interview": {"label": "Scheduling interview & video meeting", "tool": "schedule_interview"},
+    "approve_and_send_email": {"label": "Sending email via Gmail", "tool": "send_email"},
+    "verify_candidate": {"label": "Verifying LeetCode & GitHub ratings", "tool": "verify_skills"},
+    "update_candidate_status": {"label": "Updating candidate pipeline stage", "tool": "pipeline_update"},
+    "list_interviews": {"label": "Reading interview calendar", "tool": "interview_calendar"},
+    "get_pipeline_summary": {"label": "Gathering pipeline metrics", "tool": "pipeline_summary"},
+}
+
+SYSTEM_PROMPT = """You are an intelligent, proactive AI Recruiter Assistant powering an enterprise Recruitment Operating System.
+You work alongside human recruiters to find top engineering talent, evaluate technical qualifications, draft professional communications, and coordinate interviews.
+
+CRITICAL INSTRUCTIONS & RECRUITER POLICIES:
+1. Multi-turn Conversational Memory:
+   - Always remember the candidates and topics discussed in previous messages in this conversation.
+   - When the recruiter says "him", "her", "them", or asks to schedule/draft without repeating the candidate's name, refer to the candidate discussed earlier in the conversation.
+2. Email Drafting, Outreach & Immediate Sending:
+   - When the user asks to draft an email (e.g. "Draft a mail for him" or "Draft a shortlist email"):
+     - IMMEDIATELY call `draft_candidate_email` with a well-crafted, polished email body and subject line.
+     - NEVER say "nobody is waiting on a follow-up" when the recruiter explicitly asked you to draft an email! Write the requested email.
+     - CRITICAL PLACEHOLDER PREVENTION:
+       - NEVER EVER draft or output unpopulated bracket placeholders such as [DATE], [TIME], [TIMEZONE], [MEETING_PROVIDER], [JOIN_LINK], [LINK], [Company], [Your Name], [Interviewer Name]!
+       - If an interview has already been scheduled or discussed, use the EXACT date, time, timezone, platform, and actual live Microsoft Teams / Google Meet join URL returned by the scheduling tool — never invent one.
+       - Note to the recruiter: Both the candidate (attendee) and the reviewer/interviewer (host) join using this exact same Microsoft Teams / Google Meet link.
+     - In your response, clearly present the drafted email (Subject, Recipient, Body, and Interviewer/Candidate join links) and inform the user that it is queued for their approval.
+     - If the recruiter did NOT specify an interview time:
+       - You may draft an email asking for the candidate's availability OR
+       - Ask the recruiter: "What date and time would you like to schedule the interview for (e.g., tomorrow at 3:00 PM)? Once you provide the time, I can create the Microsoft Teams/Google Meet invite, generate the join link, and embed it into the email."
+   - When the user confirms to send the email (e.g. "send it", "no send it for now", "send it for now", "send the mail", "yes send it", "go ahead and send it", "approve and send", "send now", "send it again"):
+     - IMMEDIATELY call `approve_and_send_email`.
+     - If the recruiter supplied a company name, interviewer name, or asked to omit contact details, pass `company_name`, `interviewer_name`, and `omit_contact_info=true` accordingly. Never invent these values.
+     - In your final response:
+       - Clearly confirm that the invitation email has been sent to the candidate via your connected Gmail account. Mention the candidate's name, email address, company name, interviewer name, and meeting link.
+       - NEVER say "I will not send the invitation yet", "it remains in draft status", or "waiting for your approval" after calling `approve_and_send_email`!
+3. Meeting Scheduling & Video Meetings:
+   - When asked to schedule an interview or create a meeting link (Teams or Google Meet):
+     - If date and time is NOT provided: ASK the recruiter for their preferred date and time (e.g. "What date and time would you like to schedule the interview for?").
+     - If date and time IS provided (e.g. "make a meeting link on the 12th of November at 4 pm"):
+       - IMMEDIATELY call `schedule_interview` with candidate_name_or_id, time_expression, and preferred meeting_provider (microsoft_teams or google_meet).
+       - In your final response:
+         1. State clearly that the interview is confirmed and scheduled.
+         2. Provide the exact date, time, and timezone (e.g. Thursday, 12 November 2026 at 4:00 PM IST).
+         3. Provide the actual meeting join link as a prominent markdown link and bold URL.
+         4. Clearly state that the reviewer/interviewer joins using this exact same meeting URL.
+         5. Present the full drafted invitation email (Recipient, Subject, and Body) containing the join link, and confirm it is saved and queued for recruiter approval in the dashboard.
+       - NEVER say "I can't create the live meeting link in this turn", "join link to be generated", or "placeholder". The tool creates and returns the live join link immediately!
+4. Technical Verification:
+   - Use `verify_candidate` to look up LeetCode ratings, problem counts, and GitHub repositories.
+5. Proactive, Executive Assistance:
+   - Be professional, concise, proactive, and clear. Always outline next steps.
+"""
+
+
+async def _resolve_candidate(
+    session: AsyncSession, workspace_id: str, name_or_id: str | None
+) -> dict[str, Any] | None:
+    if not name_or_id:
+        # Fallback to most recent candidate in workspace
+        row = (
+            await session.execute(
+                sa.select(candidates)
+                .where(candidates.c.workspace_id == workspace_id)
+                .order_by(candidates.c.created_at.desc())
+                .limit(1)
+            )
+        ).mappings().first()
+        return dict(row) if row else None
+
+    # Check by UUID
+    try:
+        row = (
+            await session.execute(
+                sa.select(candidates).where(
+                    candidates.c.workspace_id == workspace_id,
+                    candidates.c.id == name_or_id,
+                )
+            )
+        ).mappings().first()
+        if row:
+            return dict(row)
+    except Exception:
+        pass
+
+    # Check by Name
+    clean_name = name_or_id.strip().lower()
+    row = (
+        await session.execute(
+            sa.select(candidates)
+            .where(
+                candidates.c.workspace_id == workspace_id,
+                sa.func.lower(candidates.c.full_name).like(f"%{clean_name}%"),
+            )
+            .order_by(candidates.c.created_at.desc())
+            .limit(1)
+        )
+    ).mappings().first()
+    if row:
+        return dict(row)
+
+    # Fallback to first candidate
+    row = (
+        await session.execute(
+            sa.select(candidates)
+            .where(candidates.c.workspace_id == workspace_id)
+            .order_by(candidates.c.created_at.desc())
+            .limit(1)
+        )
+    ).mappings().first()
+    return dict(row) if row else None
+
+
+# --------------------------------------------------------------------- Email Hydrator
+async def _hydrate_email_content(
+    session: AsyncSession,
+    workspace_id: str,
+    cand: dict[str, Any],
+    recruiter_id: str | None,
+    subject: str,
+    body: str,
+    company_name: str | None = None,
+    interviewer_name: str | None = None,
+    omit_contact: bool = False,
+) -> tuple[str, str, dict[str, Any]]:
+    """Plan a draft's placeholders via the shared hydrator.
+
+    Delegates to :func:`services.communications.hydrate_placeholders` so the
+    assistant draft path and the send-time safety net share one implementation.
+    """
+    sender_email = await interview_svc._recruiter_email(session, workspace_id, recruiter_id)
+    h_subj, h_body, info = await comms.hydrate_placeholders(
+        session,
+        workspace_id=workspace_id,
+        candidate=cand,
+        subject=subject,
+        body=body,
+        company_name=company_name,
+        interviewer_name=interviewer_name,
+        sender_email=sender_email,
+        omit_contact=omit_contact,
+    )
+    role_name = cand.get("current_role")
+    if role_name and "the role" in h_subj.lower():
+        h_subj = h_subj.replace("the role", role_name).replace("The Role", role_name)
+    return h_subj, h_body, info
+
+
+# --------------------------------------------------------------------- Tool Executors
+async def execute_tool_call(
+    *,
+    name: str,
+    args: dict[str, Any],
+    session: AsyncSession,
+    workspace_id: str,
+    recruiter_id: str | None,
+    accumulated_candidates: list[dict[str, Any]],
+    accumulated_pending: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if name == "search_candidates":
+        query = (args.get("query") or "").strip()
+        skills = args.get("skills") or []
+        location = args.get("location")
+        min_exp = args.get("min_experience_years")
+        status = args.get("status")
+
+        filters: dict[str, Any] = {}
+        if skills:
+            filters["skills"] = skills
+        if location:
+            filters["location"] = location
+        if min_exp:
+            filters["min_experience_years"] = min_exp
+        if status:
+            filters["pipeline_status"] = [status]
+
+        rows = await list_candidates(session, workspace_id, filters=filters, limit=10)
+        if not rows:
+            # Broad search across name, role, skills
+            stmt = sa.select(candidates).where(candidates.c.workspace_id == workspace_id).limit(10)
+            rows = [dict(r) for r in (await session.execute(stmt)).mappings().all()]
+
+        summaries = [candidate_summary(r) for r in rows]
+        accumulated_candidates.extend(summaries)
+        return {
+            "found_count": len(rows),
+            "candidates": [
+                {
+                    "id": r["id"],
+                    "name": r["full_name"],
+                    "current_role": r.get("current_role"),
+                    "skills": r.get("skills", []),
+                    "experience_years": r.get("experience_years"),
+                    "location": r.get("location"),
+                    "pipeline_status": r.get("pipeline_status"),
+                }
+                for r in rows
+            ],
+        }
+
+    elif name == "get_candidate_profile":
+        cand = await _resolve_candidate(session, workspace_id, args.get("candidate_name_or_id"))
+        if not cand:
+            return {"error": "Candidate not found."}
+        cand_sum = candidate_summary(cand)
+        accumulated_candidates.append(cand_sum)
+        return {
+            "candidate_id": cand["id"],
+            "full_name": cand["full_name"],
+            "email": cand.get("email"),
+            "current_role": cand.get("current_role"),
+            "skills": cand.get("skills", []),
+            "experience_years": cand.get("experience_years"),
+            "pipeline_status": cand.get("pipeline_status"),
+            "summary": cand.get("summary"),
+            "github_url": cand.get("github_url"),
+            "leetcode_url": cand.get("leetcode_url"),
+        }
+
+    elif name == "draft_candidate_email":
+        cand = await _resolve_candidate(session, workspace_id, args.get("candidate_name_or_id"))
+        if not cand:
+            return {"error": "Candidate not found."}
+
+        raw_subject = args.get("subject", "Update regarding your application")
+        raw_body = args.get("body", "")
+        email_type = args.get("email_type", "shortlist")
+
+        subject, body, int_info = await _hydrate_email_content(
+            session, workspace_id, cand, recruiter_id, raw_subject, raw_body
+        )
+
+        comm = await comms.queue_email(
+            session,
+            workspace_id=workspace_id,
+            candidate=cand,
+            recruiter_id=recruiter_id,
+            kind=email_type,
+            subject=subject,
+            body=body,
+            method="gpt-5-nano",
+        )
+        action = await create_pending_action(
+            session,
+            workspace_id=workspace_id,
+            recruiter_id=recruiter_id,
+            kind="send_email",
+            title=f"Send {email_type.replace('_', ' ')} email to {cand['full_name']}",
+            payload={"communication_id": comm["id"], "candidate_id": cand["id"], "subject": subject},
+        )
+
+        # Move to SHORTLISTED if shortlist email
+        if email_type == "shortlist" and cand.get("pipeline_status") != "SHORTLISTED":
+            await set_candidate_status(
+                session,
+                workspace_id=workspace_id,
+                candidate_id=cand["id"],
+                to_status="SHORTLISTED",
+                changed_by=recruiter_id,
+                reason="Candidate shortlisted via AI Assistant",
+            )
+
+        await session.commit()
+        accumulated_pending.append(action)
+        return {
+            "status": "queued_for_approval",
+            "communication_id": comm["id"],
+            "candidate_name": cand["full_name"],
+            "candidate_email": cand.get("email"),
+            "subject": subject,
+            "body": body,
+            "meeting_details": int_info,
+            "message": f"Email drafted for {cand['full_name']} and queued for your approval.",
+        }
+
+    elif name == "schedule_interview":
+        cand = await _resolve_candidate(session, workspace_id, args.get("candidate_name_or_id"))
+        if not cand:
+            return {"error": "Candidate not found."}
+
+        time_str = args.get("time_expression")
+        when = svc.parse_when(time_str, timezone_name="Asia/Kolkata")
+        if not when:
+            return {"error": f"Could not parse '{time_str}'. Ask the recruiter for a specific date and time."}
+
+        duration = int(args.get("duration_minutes") or 30)
+        provider = normalize_meeting_provider(args.get("meeting_provider"))
+        if provider == "none":
+            provider = "microsoft_teams"
+
+        payload = {
+            "candidate_id": cand["id"],
+            "candidate_name": cand.get("full_name"),
+            "start": when.astimezone(timezone.utc).isoformat(),
+            "duration_minutes": duration,
+            "timezone": "Asia/Kolkata",
+            "provider": provider,
+            "title": args.get("title") or f"Interview: {cand['full_name']}",
+            "notes": args.get("notes") or "Initial technical interview",
+        }
+
+        try:
+            res = await interview_svc.execute_schedule(
+                session,
+                workspace_id=workspace_id,
+                recruiter_id=recruiter_id,
+                payload=payload,
+            )
+        except IntegrationError as exc:
+            return {"error": f"Meeting provider error: {exc}"}
+
+        pending_act = res.get("confirmation_action") or res.get("action")
+        interview_id = res.get("interview_id") or (res.get("interview") or {}).get("id")
+        meeting_url = res.get("meeting_url") or (res.get("interview") or {}).get("meeting_url")
+
+        if pending_act:
+            accumulated_pending.append(pending_act)
+
+        comm = res.get("confirmation_email") or res.get("communication") or {}
+        email_body = comm.get("content") or comm.get("body") or ""
+        email_subject = comm.get("subject") or f"Interview Scheduled — {cand['full_name']}"
+
+        if not email_body and interview_id:
+            comm_row = (
+                await session.execute(
+                    sa.select(candidate_communications)
+                    .where(candidate_communications.c.candidate_id == cand["id"])
+                    .order_by(candidate_communications.c.created_at.desc())
+                    .limit(1)
+                )
+            ).mappings().first()
+            if comm_row:
+                email_body = comm_row.get("content") or ""
+                email_subject = comm_row.get("subject") or email_subject
+
+        formatted_time = when.astimezone(ZoneInfo("Asia/Kolkata")).strftime("%A, %d %B %Y at %I:%M %p %Z")
+        display_provider = "Google Meet" if provider == "google_meet" else "Microsoft Teams"
+
+        return {
+            "status": res.get("status") or "scheduled",
+            "candidate_name": cand["full_name"],
+            "candidate_email": cand.get("email"),
+            "scheduled_time": formatted_time,
+            "meeting_url": meeting_url,
+            "provider": display_provider,
+            "interview_id": interview_id,
+            "email_draft": {
+                "subject": email_subject,
+                "body": email_body,
+                "recipient": cand.get("email"),
+            },
+            "pending_action_id": pending_act.get("id") if pending_act else None,
+            "message": (
+                f"Interview successfully scheduled for {cand['full_name']} on {formatted_time}. "
+                f"Video Meeting Link ({display_provider}): {meeting_url}. "
+                f"Candidate invitation email has been drafted with this link and queued for recruiter approval."
+            ),
+        }
+
+    elif name == "approve_and_send_email":
+        cand = await _resolve_candidate(session, workspace_id, args.get("candidate_name_or_id"))
+        action_id = args.get("action_id")
+        company_arg = args.get("company_name")
+        interviewer_arg = args.get("interviewer_name")
+        omit_contact = bool(args.get("omit_contact_info"))
+
+        target_action = None
+        if action_id:
+            target_action = (
+                await session.execute(
+                    sa.select(pending_actions).where(
+                        pending_actions.c.id == action_id,
+                        pending_actions.c.workspace_id == workspace_id,
+                        pending_actions.c.status == "pending",
+                    )
+                )
+            ).mappings().first()
+
+        if not target_action and cand:
+            # Only ever approve a pending action that belongs to this candidate —
+            # never "any pending action in the workspace" (that could send the
+            # wrong candidate's email).
+            recent_pending = (
+                await session.execute(
+                    sa.select(pending_actions)
+                    .where(
+                        pending_actions.c.workspace_id == workspace_id,
+                        pending_actions.c.status == "pending",
+                    )
+                    .order_by(pending_actions.c.created_at.desc())
+                )
+            ).mappings().all()
+            for pa in recent_pending:
+                payload = pa.get("payload") or {}
+                if str(payload.get("candidate_id")) == str(cand["id"]):
+                    target_action = pa
+                    break
+
+        if not target_action:
+            return {
+                "status": "nothing_to_send",
+                "error": "There is no pending email to approve. Draft the email first, then approve sending it.",
+            }
+
+        # Apply explicit company/interviewer/contact overrides to the queued draft.
+        comm_id = (target_action.get("payload") or {}).get("communication_id")
+        if comm_id and cand and (company_arg or interviewer_arg or omit_contact):
+            comm_row = (
+                await session.execute(
+                    sa.select(candidate_communications).where(candidate_communications.c.id == comm_id)
+                )
+            ).mappings().first()
+            if comm_row:
+                h_subj, h_body, _ = await _hydrate_email_content(
+                    session,
+                    workspace_id,
+                    cand,
+                    recruiter_id,
+                    comm_row["subject"] or "",
+                    comm_row["content"] or "",
+                    company_name=company_arg,
+                    interviewer_name=interviewer_arg,
+                    omit_contact=omit_contact,
+                )
+                await session.execute(
+                    sa.update(candidate_communications)
+                    .where(candidate_communications.c.id == comm_id)
+                    .values(content=h_body, subject=h_subj)
+                )
+                await session.commit()
+
+        try:
+            exec_res = await interview_svc.execute_pending_action(
+                session,
+                workspace_id=workspace_id,
+                action_id=target_action["id"],
+                recruiter_id=recruiter_id,
+            )
+        except Exception as exc:
+            return {"error": f"Failed to send email: {exc}"}
+
+        accumulated_pending[:] = [a for a in accumulated_pending if a.get("id") != target_action["id"]]
+        recipient_email = (cand or {}).get("email")
+        candidate_name = (cand or {}).get("full_name") or "the candidate"
+        return {
+            "status": "sent",
+            "action_id": target_action["id"],
+            "candidate_name": candidate_name,
+            "recipient": recipient_email,
+            "provider_message_id": (exec_res.get("result") or {}).get("provider_message_id"),
+            "message": f"Email sent to {candidate_name} ({recipient_email}) via your connected Gmail account.",
+        }
+
+    elif name == "verify_candidate":
+        cand = await _resolve_candidate(session, workspace_id, args.get("candidate_name_or_id"))
+        if not cand:
+            return {"error": "Candidate not found."}
+
+        v = await verification.verify_candidate(cand, keywords=list(cand.get("skills") or []))
+        gh = v.get("github") or {}
+        lc = v.get("leetcode") or {}
+        return {
+            "candidate_name": cand["full_name"],
+            "evidence_score": v.get("evidence_score"),
+            "signals": v.get("signals") or [],
+            "github": {
+                "available": gh.get("available", False),
+                "reason": gh.get("reason"),
+                "public_repos": gh.get("public_repos"),
+                "relevant_repos": [r.get("name") for r in (gh.get("relevant_repositories") or [])[:5]],
+            },
+            "leetcode": {
+                "available": lc.get("available", False),
+                "reason": lc.get("reason"),
+                "ranking": lc.get("ranking"),
+                "total_solved": lc.get("total_solved"),
+                "solved_by_difficulty": lc.get("solved_by_difficulty") or {},
+                "contest_rating": lc.get("contest_rating"),
+            },
+        }
+
+    elif name == "update_candidate_status":
+        cand = await _resolve_candidate(session, workspace_id, args.get("candidate_name_or_id"))
+        if not cand:
+            return {"error": "Candidate not found."}
+
+        new_status = args.get("status")
+        prev = await set_candidate_status(
+            session,
+            workspace_id=workspace_id,
+            candidate_id=cand["id"],
+            to_status=new_status,
+            changed_by=recruiter_id,
+            reason="Updated via AI Assistant",
+        )
+        await session.commit()
+        return {"candidate_name": cand["full_name"], "previous_status": prev, "new_status": new_status}
+
+    elif name == "list_interviews":
+        rows = await upcoming_interviews(session, workspace_id, limit=20)
+        return {
+            "count": len(rows),
+            "interviews": [
+                {
+                    "candidate_name": r.get("candidate_name"),
+                    "start_time": r.get("start_time").isoformat() if r.get("start_time") else None,
+                    "provider": r.get("provider"),
+                    "status": r.get("status"),
+                    "meeting_url": r.get("meeting_url"),
+                }
+                for r in rows
+            ],
+        }
+
+    elif name == "get_pipeline_summary":
+        now = utcnow()
+        counts_q = sa.select(
+            sa.func.count().label("total"),
+            sa.func.count().filter(candidates.c.pipeline_status.in_(("APPLIED", "SCREENED"))).label("awaiting"),
+            sa.func.count().filter(candidates.c.pipeline_status == "SHORTLISTED").label("shortlisted"),
+        ).where(candidates.c.workspace_id == workspace_id)
+        row = (await session.execute(counts_q)).mappings().one_or_none() or {}
+        return {
+            "total_candidates": int(row.get("total") or 0),
+            "awaiting_screening": int(row.get("awaiting") or 0),
+            "shortlisted": int(row.get("shortlisted") or 0),
+        }
+
+    return {"status": "ok", "message": f"Action {name} processed."}
+
+
+# --------------------------------------------------------------------- OpenAI Chat Caller
+async def _call_openai(
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: str | None = "auto",
+) -> dict[str, Any]:
+    url = settings.openai_base_url.rstrip("/") + "/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {settings.openai_api_key}",
+        "Content-Type": "application/json",
+    }
+    payload: dict[str, Any] = {
+        "model": settings.llm_model,
+        "messages": messages,
+        "max_completion_tokens": 16384,
+    }
+    if tools:
+        payload["tools"] = tools
+        if tool_choice:
+            payload["tool_choice"] = tool_choice
+
+    resp = await get_client().post(url, json=payload, headers=headers, timeout=90)
+    if resp.status_code >= 400:
+        raise RuntimeError(f"OpenAI error {resp.status_code}: {resp.text[:200]}")
+    return resp.json()
+
+
+# --------------------------------------------------------------------- Streaming Turn Runner
+async def run_assistant_stream(
+    *,
+    session: AsyncSession,
+    workspace_id: str,
+    recruiter_id: str | None,
+    thread_id: str,
+    user_message: str,
+) -> AsyncIterator[dict[str, Any]]:
+    yield {"type": "meta", "thread_id": thread_id}
+
+    # Ensure thread exists in chat_threads
+    existing_th = (
+        await session.execute(sa.select(chat_threads).where(chat_threads.c.id == thread_id))
+    ).mappings().first()
+
+    if not existing_th:
+        now = utcnow()
+        title = user_message[:60].strip() or "New Conversation"
+        await session.execute(
+            sa.insert(chat_threads).values(
+                id=thread_id,
+                workspace_id=workspace_id,
+                title=title,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        await session.commit()
+
+    # 1. Save user message to database
+    await session.execute(
+        sa.insert(chat_messages).values(
+            id=db_module.new_id(),
+            workspace_id=workspace_id,
+            thread_id=thread_id,
+            role="user",
+            content=user_message,
+            payload={},
+            created_at=utcnow(),
+        )
+    )
+    await session.commit()
+
+    # 2. Load previous conversation history for this thread
+    prior_rows = (
+        await session.execute(
+            sa.select(chat_messages)
+            .where(
+                chat_messages.c.thread_id == thread_id,
+                chat_messages.c.workspace_id == workspace_id,
+            )
+            .order_by(chat_messages.c.created_at.asc())
+            .limit(16)
+        )
+    ).mappings().all()
+
+    messages: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
+    for row in prior_rows:
+        r = row["role"]
+        c = row["content"]
+        if r in ("user", "assistant") and c:
+            messages.append({"role": r, "content": c})
+
+    accumulated_candidates: list[dict[str, Any]] = []
+    accumulated_pending: list[dict[str, Any]] = []
+    final_reply: str = ""
+
+    # Step indicator for classify / understanding
+    yield {
+        "type": "step",
+        "id": "understand",
+        "tool": "gpt-5-nano",
+        "label": "Analyzing request & conversation context",
+        "status": "running",
+        "detail": user_message[:120],
+    }
+
+    try:
+        call_resp = await _call_openai(messages, tools=AGENT_TOOLS)
+        choice = call_resp["choices"][0]
+        msg = choice["message"]
+        tool_calls = msg.get("tool_calls") or []
+
+        yield {
+            "type": "step",
+            "id": "understand",
+            "tool": "gpt-5-nano",
+            "label": "Analyzing request & conversation context",
+            "status": "done",
+            "summary": f"Selected {len(tool_calls)} action(s)" if tool_calls else "Direct response",
+            "ms": 400,
+        }
+
+        if tool_calls:
+            # Append assistant message with tool calls to history
+            messages.append(msg)
+
+            for tc in tool_calls:
+                call_id = tc["id"]
+                fn_name = tc["function"]["name"]
+                meta = TOOL_METADATA.get(fn_name, {"label": f"Running {fn_name}", "tool": fn_name})
+
+                raw_args = tc["function"].get("arguments") or "{}"
+                try:
+                    args = json.loads(raw_args)
+                except Exception:
+                    args = {}
+
+                # Emit step start
+                arg_summary = ", ".join(f"{k}={v}" for k, v in list(args.items())[:2])
+                yield {
+                    "type": "step",
+                    "id": call_id,
+                    "tool": meta["tool"],
+                    "label": meta["label"],
+                    "status": "running",
+                    "detail": arg_summary[:100],
+                }
+
+                start_t = time.perf_counter()
+                tool_res = await execute_tool_call(
+                    name=fn_name,
+                    args=args,
+                    session=session,
+                    workspace_id=workspace_id,
+                    recruiter_id=recruiter_id,
+                    accumulated_candidates=accumulated_candidates,
+                    accumulated_pending=accumulated_pending,
+                )
+                if not isinstance(tool_res, dict):
+                    tool_res = {"status": "ok", "message": str(tool_res) if tool_res is not None else "Completed"}
+                elapsed_ms = int((time.perf_counter() - start_t) * 1000)
+
+                # Emit step done
+                yield {
+                    "type": "step",
+                    "id": call_id,
+                    "tool": meta["tool"],
+                    "label": meta["label"],
+                    "status": "done",
+                    "summary": str(tool_res.get("message") or tool_res.get("summary") or "Completed")[:120],
+                    "ms": elapsed_ms,
+                }
+
+                # Append tool response
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": json.dumps(tool_res),
+                })
+
+            # Call model again to generate final natural response
+            second_resp = await _call_openai(messages, tools=AGENT_TOOLS, tool_choice="none")
+            final_reply = second_resp["choices"][0]["message"].get("content") or ""
+        else:
+            final_reply = msg.get("content") or "I have processed your request."
+
+    except Exception as exc:
+        log.exception("Assistant agent execution failed")
+        final_reply = f"I encountered an issue processing your request: {exc}"
+
+    # 3. Stream reply tokens to client
+    async for event in _stream_reply(final_reply):
+        yield event
+
+    # 4. Save assistant message with structured payload
+    payload = to_jsonable({
+        "intent": "conversational_turn",
+        "data": {},
+        "candidates": accumulated_candidates,
+        "pending_actions": accumulated_pending,
+    })
+
+    await session.execute(
+        sa.insert(chat_messages).values(
+            id=db_module.new_id(),
+            workspace_id=workspace_id,
+            thread_id=thread_id,
+            role="assistant",
+            content=final_reply,
+            payload=payload,
+            created_at=utcnow(),
+        )
+    )
+    await session.execute(
+        sa.update(chat_threads).where(chat_threads.c.id == thread_id).values(updated_at=utcnow())
+    )
+    await session.commit()
+
+    yield {
+        "type": "done",
+        "thread_id": thread_id,
+        "message": final_reply,
+        "reply": final_reply,
+        "candidates": accumulated_candidates,
+        "pending_actions": accumulated_pending,
+    }
+
+
+# --------------------------------------------------------------------- Synchronous Runner
+async def run_assistant(
+    *,
+    session: AsyncSession,
+    workspace_id: str,
+    recruiter_id: str | None,
+    thread_id: str,
+    user_message: str,
+) -> dict[str, Any]:
+    final_payload: dict[str, Any] = {}
+    async for event in run_assistant_stream(
+        session=session,
+        workspace_id=workspace_id,
+        recruiter_id=recruiter_id,
+        thread_id=thread_id,
+        user_message=user_message,
+    ):
+        if event.get("type") == "done":
+            final_payload = event
+    return final_payload
