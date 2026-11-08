@@ -445,9 +445,9 @@ _TEAMS_SWITCH_RE = re.compile(r"microsoft\s*teams|ms\s*teams|\bteams\b", re.IGNO
 def provider_hint_from_message(message: str | None) -> str | None:
     """Best-effort provider override from the recruiter's latest message.
 
-    Only used when the model omits ``meeting_provider``. Google Meet wins ties
-    because "Google Meet" also contains the word "meet" and a switch request is
-    almost always the reason the recruiter is talking about providers at all.
+    Only used when the model omits ``meeting_provider``. Google Meet is checked
+    first so an explicit "switch to Google Meet" wins even if Teams is also
+    mentioned (e.g. "Teams failed, use Google Meet").
     """
     text = (message or "").strip()
     if not text:
