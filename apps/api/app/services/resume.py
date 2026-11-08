@@ -127,6 +127,67 @@ _KNOWN = _LANGUAGES | _FRAMEWORKS | _TOOLS | _EXTRA_SKILLS
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
 _PHONE_RE = re.compile(r"(?:(?:\+|00)\d{1,3}[\s\-.]?)?(?:\(?\d{2,5}\)?[\s\-.]?){2,5}\d{2,4}")
 _URL_RE = re.compile(r"https?://[^\s,;)\]}>\"']+", re.IGNORECASE)
+# Bare domains such as ``janedoe.dev`` or ``www.janedoe.dev``. Each label must
+# be at least two characters, and extraction only accepts lowercase matches, so
+# degree/technology names like "B.Tech" or "ASP.NET" are not treated as sites.
+_BARE_DOMAIN_RE = re.compile(
+    r"(?<![@\w.\-/])"
+    r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])\.)+"
+    r"(?:com|dev|io|tech|me|app|ai|xyz|net|org|in|co|site|page|design|studio|cloud|systems|online|website|space)"
+    r"(?:/[^\s,;)\]}>\"']*)?",
+    re.IGNORECASE,
+)
+_FILE_SUFFIXES = (
+    ".pdf", ".doc", ".docx", ".png", ".jpg", ".jpeg", ".svg", ".webp",
+    ".zip", ".ppt", ".pptx",
+)
+_PERSONAL_TLDS = (
+    ".dev", ".tech", ".me", ".app", ".io", ".ai", ".xyz", ".site", ".page",
+    ".design", ".studio", ".online", ".website", ".space",
+)
+
+
+def _extract_urls(text: str) -> list[str]:
+    """Return full http(s) URLs plus bare personal domains found in the text."""
+    urls = [url.rstrip(".,;:") for url in _URL_RE.findall(text)]
+    seen = {url.rstrip("/").lower() for url in urls}
+    for match in _BARE_DOMAIN_RE.finditer(text):
+        domain = match.group(0).rstrip(".,;:")
+        # Reject mixed-case hosts (B.Tech, ASP.NET) unless explicitly www. The
+        # path may be mixed case (e.g. github.com/Sanskaragrawal2107).
+        host = domain.split("/", 1)[0]
+        if host != host.lower() and not host.lower().startswith("www."):
+            continue
+        key = domain.rstrip("/").lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        urls.append(f"https://{domain}")
+    return urls
+
+
+def _pick_portfolio(urls: list[str], full_name: str | None) -> str | None:
+    """Pick the most likely personal site from a resume's non-social URLs."""
+    candidates = [
+        url
+        for url in urls
+        if classify_url(url) == "website"
+        and not url.lower().split("?", 1)[0].endswith(_FILE_SUFFIXES)
+    ]
+    if not candidates:
+        return None
+    tokens = {t for t in re.findall(r"[a-z0-9]+", (full_name or "").lower()) if len(t) > 2}
+
+    def score(url: str) -> int:
+        lowered = url.lower().split("?", 1)[0].rstrip("/")
+        value = 0
+        if tokens and any(token in lowered for token in tokens):
+            value += 2
+        if lowered.endswith(_PERSONAL_TLDS):
+            value += 1
+        return value
+
+    return max(candidates, key=score)
 _SECTION_WORDS = {
     "summary", "profile", "objective", "experience", "work experience", "professional experience",
     "employment", "education", "skills", "technical skills", "projects", "certifications",
@@ -363,14 +424,12 @@ def heuristic_extract(text: str, *, email_hint: str | None = None) -> ResumeExtr
             if found and len(re.sub(r"\D", "", found.group(0))) >= 8:
                 phone_match = found
                 break
-    urls = _URL_RE.findall(text)
+    urls = _extract_urls(text)
     github = next((u for u in urls if "github.com" in u.lower()), None)
     leetcode = next((u for u in urls if "leetcode.com" in u.lower()), None)
     linkedin = next((u for u in urls if "linkedin.com" in u.lower()), None)
-    portfolio = next(
-        (u for u in urls if not any(k in u.lower() for k in ("github.com", "leetcode.com", "linkedin.com"))),
-        None,
-    )
+    full_name = _guess_name(lines)
+    portfolio = _pick_portfolio(urls, full_name)
     skills, languages, frameworks, tools = _skills(text)
     education, university, grad_year = _education(sections.get("education") or lines)
     project_lines = sections.get("projects") or []
@@ -378,7 +437,7 @@ def heuristic_extract(text: str, *, email_hint: str | None = None) -> ResumeExtr
     summary_lines = sections.get("summary") or sections.get("profile") or []
 
     extracted = ResumeExtraction(
-        full_name=_guess_name(lines),
+        full_name=full_name,
         email=email_match.group(0) if email_match else (email_hint or None),
         phone=phone_match.group(0).strip() if phone_match else None,
         location=_guess_location(lines),

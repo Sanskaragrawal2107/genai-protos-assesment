@@ -140,6 +140,90 @@ def test_verify_candidate_without_enrich_skips_website(monkeypatch):
     assert "website" not in result
 
 
+def test_normalize_url_upgrades_schemeless_hosts():
+    from app.services.profile_links import normalize_url
+
+    assert normalize_url("sanskaragrawal.tech") == "https://sanskaragrawal.tech"
+    assert normalize_url("https://sanskaragrawal.tech/") == "https://sanskaragrawal.tech/"
+    assert normalize_url("   ") is None
+    assert normalize_url(None) is None
+
+
+def test_parse_website_extracts_text_and_headings():
+    html = """
+    <html><head><title>Jane Doe</title></head>
+    <body>
+      <h1>Jane Doe</h1>
+      <h2>Projects</h2>
+      <p>Built Hire a Human with LangGraph.</p>
+      <script>var x = 'secret-token';</script>
+      <style>.a{color:red}</style>
+    </body></html>
+    """
+    parsed = parse_website(html, "https://janedoe.dev/")
+    assert parsed["headings"][0] == {"tag": "h1", "text": "Jane Doe"}
+    assert any(h["text"] == "Projects" for h in parsed["headings"])
+    assert "Built Hire a Human with LangGraph." in parsed["text"]
+    assert "secret-token" not in parsed["text"]
+    assert "color:red" not in parsed["text"]
+
+
+def test_resume_extracts_bare_portfolio_domain_without_degree_noise():
+    from app.services.resume import _extract_urls, _pick_portfolio
+
+    text = "Sanskar Agrawal\nB.Tech CSE, ASP.NET developer\nPortfolio: sanskaragrawal.tech\n"
+    urls = _extract_urls(text)
+    assert "https://sanskaragrawal.tech" in urls
+    assert not any("B.Tech" in u or "ASP.NET" in u for u in urls)
+    assert _extract_urls("mail me at jane@example.com") == []
+    assert _pick_portfolio(
+        ["https://example.com/resume.pdf", "https://acropolis.in", "https://sanskaragrawal.tech"],
+        "Sanskar Agrawal",
+    ) == "https://sanskaragrawal.tech"
+    # Mixed-case paths are fine as long as the host is lowercase.
+    assert "https://github.com/Sanskaragrawal2107" in _extract_urls(
+        "GitHub: github.com/Sanskaragrawal2107"
+    )
+
+
+def test_verify_candidate_always_reads_website_when_enrich(monkeypatch):
+    fetched = {"n": 0}
+
+    async def fake_fetch(url):
+        fetched["n"] += 1
+        return {
+            "available": True,
+            "final_url": url,
+            "title": "Jane Doe",
+            "description": None,
+            "headings": [{"tag": "h2", "text": "Projects"}],
+            "text": "Hire a Human — LangGraph",
+            "links": {"github": [], "leetcode": [], "linkedin": [], "website": []},
+        }
+
+    async def fake_github(url, *, keywords=None):
+        return {"provider": "github", "available": False, "reason": "down"}
+
+    async def fake_leetcode(url):
+        return {"provider": "leetcode", "available": False, "reason": "down"}
+
+    monkeypatch.setattr(verification.profile_links, "fetch_website", fake_fetch)
+    monkeypatch.setattr(verification, "verify_github", fake_github)
+    monkeypatch.setattr(verification, "verify_leetcode", fake_leetcode)
+
+    candidate = {
+        "github_url": "https://github.com/janedoe",
+        "leetcode_url": "https://leetcode.com/u/janedoe/",
+        "portfolio_url": "https://janedoe.dev",
+    }
+    result = asyncio.run(verification.verify_candidate(candidate, keywords=[], enrich=True))
+
+    # GitHub/LeetCode are already known, but the page is still read.
+    assert fetched["n"] == 1
+    assert result["website"]["text"] == "Hire a Human — LangGraph"
+    assert result["website"]["headings"][0]["text"] == "Projects"
+
+
 def test_leetcode_graphql_is_primary_and_skips_mcp(monkeypatch):
     called = {"mcp": 0}
 

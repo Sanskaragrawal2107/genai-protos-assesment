@@ -319,9 +319,11 @@ async def verify_candidate(
     """Run both verifications concurrently and package the evidence.
 
     When ``enrich`` is set and a personal website/portfolio is on file, that page
-    is fetched once so any GitHub/LeetCode links it exposes can be verified even
-    when the resume itself did not list them. Without ``enrich`` this behaves as
-    before (used by the batch evaluation path, which must stay fast).
+    is fetched and its visible content plus any GitHub/LeetCode links are
+    returned. The crawl runs even when GitHub/LeetCode are already known, so a
+    recruiter asking to "check the portfolio" always gets the page read. Without
+    ``enrich`` this behaves as before (used by the batch evaluation path, which
+    must stay fast).
     """
     github_url = candidate.get("github_url")
     leetcode_url = candidate.get("leetcode_url")
@@ -338,7 +340,7 @@ async def verify_candidate(
 
     website: dict[str, Any] | None = None
     discovered: dict[str, str] = {}
-    if enrich and website_url and (not github_url or not leetcode_url):
+    if enrich and website_url:
         website = await profile_links.fetch_website(website_url)
         if website.get("available"):
             discovered = profile_links.profiles_from_links(website.get("links") or {})

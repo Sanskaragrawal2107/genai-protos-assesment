@@ -175,9 +175,10 @@ AGENT_TOOLS = [
         "function": {
             "name": "verify_candidate",
             "description": (
-                "Verify candidate technical credentials: uses LeetCode FastMCP for problem rankings, ratings, and solved count, "
-                "and checks GitHub repositories. If the recruiter supplies a LeetCode or GitHub profile URL, pass it in "
-                "leetcode_url/github_url so it is saved on the candidate and actually checked."
+                "Verify candidate technical credentials: checks LeetCode (solved counts, ranking) and GitHub repositories. "
+                "It also fetches the candidate's personal website/portfolio and returns the page's visible text, headings/projects, "
+                "contact links, and any GitHub/LeetCode/LinkedIn profiles found there. If the recruiter supplies any profile URL "
+                "(leetcode_url / github_url / profile_url), pass it so it is saved on the candidate and actually checked."
             ),
             "parameters": {
                 "type": "object",
@@ -193,7 +194,7 @@ AGENT_TOOLS = [
                     },
                     "profile_url": {
                         "type": "string",
-                        "description": "Personal website / portfolio URL supplied by the recruiter. Saved to the candidate; when GitHub or LeetCode are missing, the tool crawls this page to discover them and then verifies.",
+                        "description": "Personal website / portfolio URL supplied by the recruiter. Saved to the candidate; the tool fetches the page, returns its projects/text/links, and discovers any GitHub/LeetCode profiles it links to.",
                     },
                 },
                 "required": ["candidate_name_or_id"],
@@ -330,7 +331,8 @@ CRITICAL INSTRUCTIONS & RECRUITER POLICIES:
 4. Technical Verification:
    - Use `verify_candidate` to look up LeetCode ratings, problem counts, and GitHub repositories.
    - If the recruiter provides a LeetCode or GitHub profile URL, pass it to `verify_candidate` as `leetcode_url` / `github_url`. Never report a profile as "not verified" when the recruiter just gave you a URL — call the tool with that URL first.
-   - If the recruiter provides a personal website or portfolio URL, pass it as `profile_url`. The tool saves it, and when GitHub/LeetCode are missing it crawls the page to discover and then verify them. Report what it found on the website.
+   - If the recruiter provides a personal website or portfolio URL, or asks you to check/inspect the candidate's portfolio (even a URL in the message), pass it as `profile_url`. The tool fetches the live page and returns `website.text`, `website.headings`, `website.links` and any discovered GitHub/LeetCode/LinkedIn profiles. Summarise the projects, skills, and claims actually on that page, and verify the profiles it links to.
+   - You CAN read websites through this tool. NEVER say "I can't browse the live site" or ask the recruiter to paste the content — call `verify_candidate` with `profile_url` instead.
 5. Proactive, Executive Assistance:
    - Be professional, concise, proactive, and clear. Always outline next steps.
 """
@@ -745,9 +747,9 @@ async def execute_tool_call(
         # URLs are silently ignored and LeetCode/GitHub always reports "not
         # verified".
         updates: dict[str, Any] = {}
-        github_arg = (args.get("github_url") or "").strip()
-        leetcode_arg = (args.get("leetcode_url") or "").strip()
-        profile_arg = (args.get("profile_url") or "").strip()
+        github_arg = verification.profile_links.normalize_url(args.get("github_url")) or ""
+        leetcode_arg = verification.profile_links.normalize_url(args.get("leetcode_url")) or ""
+        profile_arg = verification.profile_links.normalize_url(args.get("profile_url")) or ""
         if (
             github_arg
             and verification.parse_username(github_arg, "github.com")
@@ -838,6 +840,8 @@ async def execute_tool_call(
                 "url": website.get("final_url") or cand.get("portfolio_url"),
                 "title": website.get("title"),
                 "description": website.get("description"),
+                "headings": (website.get("headings") or [])[:40],
+                "text": website.get("text"),
                 "discovered": discovered,
                 "links": {
                     kind: (website.get("links") or {}).get(kind, [])[:5]

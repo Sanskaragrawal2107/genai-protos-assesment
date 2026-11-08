@@ -1,13 +1,13 @@
-"""Discover a candidate's public profiles from a personal website.
+"""Read a candidate's personal website: contact links, visible content, profiles.
 
 Resumes frequently list a personal site (e.g. ``janedoe.dev``) or a generic
 "portfolio" link that itself points at the candidate's GitHub, LeetCode and
-LinkedIn. When those canonical URLs are not stated on the resume, we fetch the
-site once and mine its anchors so verification has something real to check.
+LinkedIn. Fetching the page once lets the assistant read the projects, skills
+and claims it describes, and mine the anchors when canonical links are missing.
 
 Everything here is best-effort and evidence-only: a failure returns
-``available: False`` with a reason, and we never invent a link. HTML is parsed
-with the standard library so no extra dependency is required.
+``available: False`` with a reason, and we never invent a link or a claim. HTML
+is parsed with the standard library so no extra dependency is required.
 
 Security note: URLs here come from untrusted resumes, so requests are restricted
 to public http(s) hosts (literal loopback/private/link-local addresses are
@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import ipaddress
 import logging
+import re
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 from typing import Any
@@ -31,7 +32,17 @@ log = logging.getLogger("recruiter.profile_links")
 # Bounds that keep one hostile page from exhausting memory or a worker.
 _MAX_HTML_BYTES = 600_000
 _MAX_LINKS_PER_KIND = 5
+_MAX_TEXT_CHARS = 12_000
+_MAX_HEADINGS = 40
 _IGNORED_SCHEMES = {"mailto", "tel", "javascript", "data"}
+# Tags whose text is code/markup noise rather than page content.
+_SKIP_TAGS = {"script", "style", "noscript", "template", "svg"}
+# Tags that should start/end a line in the extracted text.
+_BLOCK_TAGS = {
+    "p", "div", "section", "article", "header", "footer", "main", "nav",
+    "ul", "ol", "li", "table", "tr", "br",
+    "h1", "h2", "h3", "h4", "h5", "h6",
+}
 
 # Hosts whose subdomains map to a canonical profile field.
 _SOCIAL_HOSTS: dict[str, tuple[str, ...]] = {
@@ -53,6 +64,18 @@ def _host_of(url: str) -> str | None:
     except ValueError:
         return None
     return (parsed.hostname or "").lower() or None
+
+
+def normalize_url(url: str | None) -> str | None:
+    """Return an absolute URL, upgrading a schemeless host to https."""
+    if not url:
+        return None
+    url = url.strip()
+    if not url:
+        return None
+    if "://" in url:
+        return url
+    return f"https://{url}"
 
 
 def classify_url(url: str | None) -> str:
@@ -108,23 +131,36 @@ def is_public_url(url: str | None) -> bool:
     return not (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast)
 
 
-class _AnchorParser(HTMLParser):
-    """Collect anchor hrefs plus the page title/description."""
+class _PageParser(HTMLParser):
+    """Collect anchors, title/description, headings and visible text."""
 
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self.hrefs: list[str] = []
         self.title_parts: list[str] = []
         self.description: str = ""
+        self.headings: list[dict[str, str]] = []
+        self.text_parts: list[str] = []
         self._in_title = False
+        self._heading_tag: str | None = None
+        self._heading_parts: list[str] = []
+        self._skip_depth = 0
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag in _SKIP_TAGS:
+            self._skip_depth += 1
+            return
+        if tag in _BLOCK_TAGS:
+            self.text_parts.append("\n")
         if tag == "a":
             for key, value in attrs:
                 if key == "href" and value:
                     self.hrefs.append(value)
         elif tag == "title":
             self._in_title = True
+        elif tag in ("h1", "h2", "h3", "h4"):
+            self._heading_tag = tag
+            self._heading_parts = []
         elif tag == "meta":
             data = {k.lower(): (v or "") for k, v in attrs}
             name = (data.get("name") or data.get("property") or "").lower()
@@ -132,22 +168,50 @@ class _AnchorParser(HTMLParser):
                 self.description = data.get("content", "")
 
     def handle_endtag(self, tag: str) -> None:
+        if tag in _SKIP_TAGS:
+            if self._skip_depth:
+                self._skip_depth -= 1
+            return
+        if tag in _BLOCK_TAGS:
+            self.text_parts.append("\n")
         if tag == "title":
             self._in_title = False
+        elif tag == self._heading_tag:
+            text = " ".join("".join(self._heading_parts).split())
+            if text and len(self.headings) < _MAX_HEADINGS:
+                self.headings.append({"tag": tag, "text": text[:160]})
+            self._heading_tag = None
+            self._heading_parts = []
 
     def handle_data(self, data: str) -> None:
+        if self._skip_depth:
+            return
         if self._in_title:
             self.title_parts.append(data)
+            return
+        if self._heading_tag:
+            self._heading_parts.append(data)
+        self.text_parts.append(data)
+
+
+def _clean_text(parts: list[str]) -> str:
+    """Collapse raw text nodes into readable, bounded lines."""
+    text = "".join(parts)
+    text = re.sub(r"[ \t\f\v]+", " ", text)
+    text = re.sub(r" *\n *", "\n", text)
+    text = re.sub(r"\n{2,}", "\n", text).strip()
+    return text[:_MAX_TEXT_CHARS]
 
 
 def parse_website(html: str, base_url: str) -> dict[str, Any]:
-    """Return ``{title, description, links: {kind: [url, ...]}}`` for a page.
+    """Return the page's identity, visible text, headings and links.
 
     Links are resolved against ``base_url``, de-duplicated in document order and
-    grouped by :func:`classify_url`. Social links are ordered ahead of generic
-    ones so a verification pass sees GitHub/LeetCode first.
+    grouped by :func:`classify_url`. ``text`` is the readable page content (with
+    scripts/styles removed) so the assistant can summarise projects and claims
+    even when a site has no machine-readable data.
     """
-    parser = _AnchorParser()
+    parser = _PageParser()
     try:
         parser.feed(html)
     except Exception as exc:  # noqa: BLE001 - malformed markup from the wild
@@ -177,7 +241,13 @@ def parse_website(html: str, base_url: str) -> dict[str, Any]:
 
     title = " ".join("".join(parser.title_parts).split())[:200] or None
     description = " ".join(parser.description.split())[:400] or None
-    return {"title": title, "description": description, "links": buckets}
+    return {
+        "title": title,
+        "description": description,
+        "headings": parser.headings,
+        "text": _clean_text(parser.text_parts),
+        "links": buckets,
+    }
 
 
 def profiles_from_links(links: dict[str, list[str]]) -> dict[str, str]:
@@ -202,6 +272,7 @@ async def fetch_website(url: str | None) -> dict[str, Any]:
     if not url:
         base["reason"] = "No personal website or portfolio URL on the resume"
         return base
+    url = normalize_url(url) or url
     if not is_public_url(url):
         base["reason"] = "Personal website URL is missing or not a public http(s) address"
         return base
@@ -232,10 +303,12 @@ async def fetch_website(url: str | None) -> dict[str, Any]:
             "final_url": str(resp.url),
             "title": parsed["title"],
             "description": parsed["description"],
+            "headings": parsed["headings"],
+            "text": parsed["text"],
             "links": parsed["links"],
             "caveat": (
-                "Links found on the candidate's own website. Their presence is not proof of "
-                "ownership or quality; each is verified separately when possible."
+                "Content and links read from the candidate's own website. Presence is not "
+                "proof of ownership or quality; profile links are verified separately when possible."
             ),
         }
     )
