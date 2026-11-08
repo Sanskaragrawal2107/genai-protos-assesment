@@ -193,17 +193,24 @@ async def verify_leetcode(url: str | None) -> dict[str, Any]:
         base["reason"] = "No LeetCode profile URL on the resume"
         return base
 
-    if settings.leetcode_mcp_enabled:
-        from .leetcode_mcp import fetch_leetcode_evidence
+    # The public GraphQL endpoint is primary: it is the one that actually
+    # answers today and returns in about a second. The hosted MCP server (if
+    # configured) is only consulted as an opt-in last resort when GraphQL is
+    # unavailable, so a broken MCP handshake never adds latency to the normal
+    # path. ``LEETCODE_MCP_FALLBACK=true`` turns that last resort on.
+    graphql = await _verify_leetcode_graphql(username)
+    if graphql.get("available") or not (settings.leetcode_mcp_enabled and settings.leetcode_mcp_fallback):
+        return graphql
 
-        evidence = await fetch_leetcode_evidence(username)
-        if evidence.get("available"):
-            return evidence
-        fallback = await _verify_leetcode_graphql(username)
-        fallback["fallback_from"] = "leetcode-mcp"
-        fallback["fallback_reason"] = evidence.get("reason")
-        return fallback
-    return await _verify_leetcode_graphql(username)
+    from .leetcode_mcp import fetch_leetcode_evidence
+
+    evidence = await fetch_leetcode_evidence(username)
+    if evidence.get("available"):
+        evidence["fallback_from"] = graphql.get("source")
+        evidence["fallback_reason"] = graphql.get("reason")
+        return evidence
+    graphql["fallback_reason"] = evidence.get("reason")
+    return graphql
 
 
 async def _verify_leetcode_graphql(username: str) -> dict[str, Any]:

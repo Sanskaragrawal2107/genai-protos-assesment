@@ -1,5 +1,6 @@
 import asyncio
 
+from app.config import settings
 from app.schemas import ResumeExtraction
 from app.services import verification
 from app.services.profile_links import (
@@ -137,3 +138,70 @@ def test_verify_candidate_without_enrich_skips_website(monkeypatch):
 
     assert calls["website"] == 0
     assert "website" not in result
+
+
+def test_leetcode_graphql_is_primary_and_skips_mcp(monkeypatch):
+    called = {"mcp": 0}
+
+    async def fake_graphql(username):
+        return {
+            "provider": "leetcode",
+            "source": "leetcode.com public GraphQL (unofficial endpoint)",
+            "username": username,
+            "available": True,
+            "total_solved": 10,
+        }
+
+    async def fake_mcp(username):
+        called["mcp"] += 1
+        return {"available": True}
+
+    from app.services import leetcode_mcp as lc_mcp
+
+    monkeypatch.setattr(verification, "_verify_leetcode_graphql", fake_graphql)
+    monkeypatch.setattr(lc_mcp, "fetch_leetcode_evidence", fake_mcp)
+    monkeypatch.setattr(settings, "leetcode_mcp_url", "https://mcp.example/mcp")
+    monkeypatch.setattr(settings, "leetcode_mcp_token", "token")
+    monkeypatch.setattr(settings, "leetcode_mcp_fallback", True)
+
+    out = asyncio.run(verification.verify_leetcode("https://leetcode.com/u/jane/"))
+    assert out["available"] is True
+    assert called["mcp"] == 0  # GraphQL answered, so MCP is never attempted
+
+
+def test_leetcode_mcp_fallback_only_when_opted_in(monkeypatch):
+    called = {"mcp": 0}
+
+    async def fake_graphql(username):
+        return {
+            "provider": "leetcode",
+            "source": "graphql",
+            "username": username,
+            "available": False,
+            "reason": "public endpoint unavailable",
+        }
+
+    async def fake_mcp(username):
+        called["mcp"] += 1
+        return {"available": True, "source": "leetcode-mcp"}
+
+    from app.services import leetcode_mcp as lc_mcp
+
+    monkeypatch.setattr(verification, "_verify_leetcode_graphql", fake_graphql)
+    monkeypatch.setattr(lc_mcp, "fetch_leetcode_evidence", fake_mcp)
+    monkeypatch.setattr(settings, "leetcode_mcp_url", "https://mcp.example/mcp")
+    monkeypatch.setattr(settings, "leetcode_mcp_token", "token")
+
+    # Fallback disabled: GraphQL failure is final, MCP stays untouched.
+    monkeypatch.setattr(settings, "leetcode_mcp_fallback", False)
+    out = asyncio.run(verification.verify_leetcode("https://leetcode.com/u/jane/"))
+    assert out["available"] is False
+    assert called["mcp"] == 0
+
+    # Opted in: MCP is consulted only because GraphQL failed, and it wins.
+    monkeypatch.setattr(settings, "leetcode_mcp_fallback", True)
+    out = asyncio.run(verification.verify_leetcode("https://leetcode.com/u/jane/"))
+    assert out["available"] is True
+    assert called["mcp"] == 1
+    assert out["fallback_from"] == "graphql"
+

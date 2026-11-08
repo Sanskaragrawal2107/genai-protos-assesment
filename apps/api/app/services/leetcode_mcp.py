@@ -1,11 +1,14 @@
 """LeetCode evidence through the hosted MCP server.
 
-The MCP server is the primary source for candidate qualification checks. It is
-an external, unfamiliar surface: tool names are discovered per process when the
-server can list them, otherwise the documented tool names are used. Any failure
-is returned as ``available: false`` with a reason — never as zero activity — so
-callers can fall back to the public GraphQL endpoint without turning an outage
-into a negative claim about the candidate.
+This is an *optional* evidence source. The public GraphQL endpoint in
+``verification.py`` is primary; this module is only consulted when
+``LEETCODE_MCP_FALLBACK`` is enabled and GraphQL is unavailable.
+
+The MCP server is an external, unfamiliar surface: tool names are discovered
+per process when the server can list them, otherwise the documented tool names
+are used. Any failure is returned as ``available: false`` with a reason —
+never as zero activity — so an outage is never turned into a negative claim
+about the candidate.
 """
 from __future__ import annotations
 

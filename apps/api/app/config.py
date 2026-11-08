@@ -109,11 +109,13 @@ class Settings(BaseSettings):
     # github — optional; raises the anonymous rate limit.
     github_token: str = ""
 
-    # leetcode — hosted MCP server is the primary evidence source. The public
-    # GraphQL endpoint is only a fallback when the MCP server is unreachable.
+    # leetcode — the public GraphQL endpoint is the primary evidence source. The
+    # hosted MCP server is optional and only tried as a last resort when
+    # LEETCODE_MCP_FALLBACK is enabled and GraphQL is unavailable.
     leetcode_mcp_url: str = ""
     leetcode_mcp_token: str = ""
     leetcode_mcp_timeout_seconds: float = 30.0
+    leetcode_mcp_fallback: bool = False
 
     # MCP server (apps/mcp). Resolved server-side, never from model input.
     mcp_workspace_id: str = ""
