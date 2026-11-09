@@ -2,7 +2,7 @@
 
 import { useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
-import { ArrowRight, CheckCircle2, Loader2, Lock, Mail } from "lucide-react";
+import { ArrowRight, Loader2, Lock, Mail } from "lucide-react";
 import { useAuth } from "@/app/providers";
 import { supabase } from "@/lib/supabase";
 import { Alert } from "@/components/ui";
@@ -12,13 +12,10 @@ export default function LoginPage() {
   const { token } = useAuth();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-  const [usePassword, setUsePassword] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [sent, setSent] = useState(false);
 
-  // Once Supabase establishes a session (password sign-in or magic-link return)
-  // there is nothing left to do here.
+  // Once Supabase establishes a session there is nothing left to do here.
   useEffect(() => {
     if (token) router.replace("/");
   }, [token, router]);
@@ -28,21 +25,9 @@ export default function LoginPage() {
     setBusy(true);
     setError(null);
     try {
-      if (usePassword) {
-        const { error } = await supabase.auth.signInWithPassword({ email, password });
-        if (error) throw error;
-        router.replace("/");
-      } else {
-        const { error } = await supabase.auth.signInWithOtp({
-          email,
-          options: {
-            emailRedirectTo:
-              typeof window !== "undefined" ? `${window.location.origin}/` : undefined,
-          },
-        });
-        if (error) throw error;
-        setSent(true);
-      }
+      const { error } = await supabase.auth.signInWithPassword({ email, password });
+      if (error) throw error;
+      router.replace("/");
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -72,90 +57,57 @@ export default function LoginPage() {
             Sign in to your workspace
           </h1>
           <p className="mt-1.5 text-[12.5px] leading-5 text-[#71717a]">
-            {sent
-              ? "A sign-in link is on its way."
-              : "Use your work email. Access is limited to invited members of this workspace."}
+            Use your work email and password. Access is limited to invited members of this
+            workspace.
           </p>
 
           <div className="mt-7">
-            {sent ? (
-              <div className="rounded-[10px] border border-[#e7e7e4] bg-[#fcfcfb] p-4">
-                <div className="flex items-start gap-2.5">
-                  <CheckCircle2 className="mt-px shrink-0 text-[#2c7a4b]" size={16} />
-                  <div className="space-y-1 text-[12px] leading-5 text-[#52525b]">
-                    <p className="text-[12.5px] font-medium text-[#18181b]">Check your inbox</p>
-                    <p>
-                      We sent a sign-in link to{" "}
-                      <span className="font-medium text-[#27272a]">{email}</span>. Open it in this
-                      browser to finish signing in.
-                    </p>
-                    <button className="link text-[11px]" onClick={() => setSent(false)}>
-                      Use a different email
-                    </button>
-                  </div>
+            <form className="space-y-4" onSubmit={submit}>
+              <div>
+                <label className="label">Work email</label>
+                <div className="relative">
+                  <Mail
+                    size={14}
+                    className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-[#a1a1aa]"
+                  />
+                  <input
+                    className="input pl-9"
+                    type="email"
+                    autoComplete="email"
+                    placeholder="you@company.com"
+                    value={email}
+                    onChange={(event) => setEmail(event.target.value)}
+                    required
+                  />
                 </div>
               </div>
-            ) : (
-              <form className="space-y-4" onSubmit={submit}>
-                <div>
-                  <label className="label">Work email</label>
-                  <div className="relative">
-                    <Mail
-                      size={14}
-                      className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-[#a1a1aa]"
-                    />
-                    <input
-                      className="input pl-9"
-                      type="email"
-                      autoComplete="email"
-                      placeholder="you@company.com"
-                      value={email}
-                      onChange={(event) => setEmail(event.target.value)}
-                      required
-                    />
-                  </div>
+
+              <div>
+                <label className="label">Password</label>
+                <div className="relative">
+                  <Lock
+                    size={14}
+                    className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-[#a1a1aa]"
+                  />
+                  <input
+                    className="input pl-9"
+                    type="password"
+                    autoComplete="current-password"
+                    placeholder="••••••••"
+                    value={password}
+                    onChange={(event) => setPassword(event.target.value)}
+                    required
+                  />
                 </div>
+              </div>
 
-                {usePassword ? (
-                  <div>
-                    <label className="label">Password</label>
-                    <div className="relative">
-                      <Lock
-                        size={14}
-                        className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-[#a1a1aa]"
-                      />
-                      <input
-                        className="input pl-9"
-                        type="password"
-                        autoComplete="current-password"
-                        placeholder="••••••••"
-                        value={password}
-                        onChange={(event) => setPassword(event.target.value)}
-                        required
-                      />
-                    </div>
-                  </div>
-                ) : null}
+              {error ? <Alert tone="error">{error}</Alert> : null}
 
-                {error ? <Alert tone="error">{error}</Alert> : null}
-
-                <button className="btn-primary w-full" type="submit" disabled={busy}>
-                  {busy ? <Loader2 size={14} className="animate-spin" /> : <ArrowRight size={14} />}
-                  {usePassword ? "Sign in" : "Continue with email"}
-                </button>
-
-                <button
-                  type="button"
-                  className="link text-[11px]"
-                  onClick={() => {
-                    setUsePassword((value) => !value);
-                    setError(null);
-                  }}
-                >
-                  {usePassword ? "Email me a magic link instead" : "Sign in with a password instead"}
-                </button>
-              </form>
-            )}
+              <button className="btn-primary w-full" type="submit" disabled={busy}>
+                {busy ? <Loader2 size={14} className="animate-spin" /> : <ArrowRight size={14} />}
+                Sign in
+              </button>
+            </form>
           </div>
 
           <div className="mt-10 border-t border-[#f0f0ed] pt-4">

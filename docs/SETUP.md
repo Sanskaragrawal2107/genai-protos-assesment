@@ -29,10 +29,8 @@ deploying.
 select id, public from storage.buckets where id = 'resumes';
 ```
 
-4. Create a user under **Authentication → Users** (email + password), or use
-   magic links. For magic links on a local test, set **Authentication → URL
-   Configuration → Site URL** to `http://localhost:3000` and add
-   `http://localhost:3000/**` as a redirect URL.
+4. Create a user under **Authentication → Users** (email + password). The web
+   app signs in with email and password; magic links are not used.
 
 ### Credentials to copy
 
