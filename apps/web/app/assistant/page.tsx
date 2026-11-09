@@ -6,6 +6,7 @@ import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from "rea
 import {
   ArrowRight,
   ArrowUp,
+  Brain,
   Briefcase,
   Check,
   CheckCheck,
@@ -71,6 +72,7 @@ interface Turn {
   steps?: Step[];
   streaming?: boolean;
   progressMs?: number;
+  reasoning?: string;
 }
 
 interface ThreadSummary {
@@ -269,6 +271,10 @@ function AssistantInner() {
             pending: message.payload?.pending_actions,
             connections: message.payload?.connections,
             data: message.payload?.data,
+            reasoning:
+              typeof message.payload?.data?.reasoning === "string"
+                ? (message.payload.data.reasoning as string)
+                : undefined,
           })),
         );
 
@@ -411,6 +417,11 @@ function AssistantInner() {
             patch((turn) => ({ ...turn, progressMs: typeof elapsed === "number" ? elapsed : turn.progressMs }));
             return;
           }
+          if (event === "reasoning") {
+            const chunk = (data as { text?: string }).text ?? "";
+            if (chunk) patch((turn) => ({ ...turn, reasoning: (turn.reasoning ?? "") + chunk }));
+            return;
+          }
           if (event === "connect") {
             const connection = data as AppConnection;
             if (connection?.url && connection?.toolkit) {
@@ -439,6 +450,10 @@ function AssistantInner() {
             patch((turn) => ({
               ...turn,
               streaming: false,
+              progressMs: undefined,
+              reasoning:
+                payload.reasoning ??
+                (typeof payload.data?.reasoning === "string" ? payload.data.reasoning : turn.reasoning),
               text: payload.reply || payload.message || turn.text,
               candidates: payload.candidates,
               pending: payload.pending_actions,
@@ -761,6 +776,10 @@ function AssistantInner() {
                       <span className="font-medium text-[#3f3f46]">Recruiter OS</span>
                     </div>
 
+                    {turn.reasoning ? (
+                      <ReasoningDisclosure text={turn.reasoning} streaming={turn.streaming} />
+                    ) : null}
+
                     {turn.steps && turn.steps.length > 0 ? (
                       <ToolExecutionAccordion steps={turn.steps} />
                     ) : null}
@@ -769,7 +788,7 @@ function AssistantInner() {
                       <MarkdownMessage content={turn.text} streaming={turn.streaming} />
                     ) : null}
 
-                    {turn.streaming && !turn.text ? (
+                    {turn.streaming && !turn.text && !turn.reasoning ? (
                       <div className="flex items-center gap-2 py-1 text-[12px] text-[#8a8a93]">
                         <Loader2 size={13} className="animate-spin" />
                         <span>
@@ -1068,6 +1087,49 @@ function ThreadItem({
       >
         <Trash2 size={11} />
       </button>
+    </div>
+  );
+}
+
+function ReasoningDisclosure({ text, streaming }: { text: string; streaming?: boolean }) {
+  const [open, setOpen] = useState(!!streaming);
+
+  // Open while the model is thinking and fold it away once the answer is ready.
+  // A manual toggle afterwards is respected: this effect only fires on change.
+  useEffect(() => {
+    if (!streaming) setOpen(false);
+  }, [streaming]);
+
+  return (
+    <div className="overflow-hidden rounded-[8px] border border-[#ececea] bg-[#fbfbfa]">
+      <button
+        type="button"
+        onClick={() => setOpen((value) => !value)}
+        aria-expanded={open}
+        className="flex w-full items-center justify-between gap-2 px-2.5 py-1.5 text-left transition-colors hover:bg-[#f7f7f4]"
+      >
+        <span className="flex min-w-0 items-center gap-1.5">
+          <Brain size={11} className="shrink-0 text-[#8a8a93]" />
+          <span className="truncate text-[11.5px] font-medium text-[#52525b]">
+            {streaming ? "Thinking..." : "Thought process"}
+          </span>
+        </span>
+        <ChevronDown
+          size={13}
+          className={`shrink-0 text-[#a1a1aa] transition-transform ${open ? "rotate-180" : ""}`}
+        />
+      </button>
+
+      {open ? (
+        <div className="max-h-56 overflow-y-auto border-t border-[#f0f0ed] bg-white px-3 py-2">
+          <p className="whitespace-pre-wrap break-words text-[11.5px] leading-[1.65] text-[#71717a]">
+            {text}
+            {streaming ? (
+              <span className="ml-0.5 inline-block h-3 w-1 animate-pulse bg-[#a1a1aa] align-middle" />
+            ) : null}
+          </p>
+        </div>
+      ) : null}
     </div>
   );
 }

@@ -36,6 +36,7 @@ def _fake_settings(**overrides):
     values = {
         "llm_model": "gpt-5-nano",
         "llm_reasoning_effort": "minimal",
+        "llm_reasoning_summary": "auto",
         "llm_temperature": 0.1,
         "openai_api_key": "test-key",
         "openai_base_url": "https://api.openai.com/v1",
@@ -44,15 +45,33 @@ def _fake_settings(**overrides):
     return SimpleNamespace(**values)
 
 
-def test_chat_model_sends_reasoning_effort_for_reasoning_models(monkeypatch):
+def test_chat_model_streams_reasoning_summary_via_responses_api(monkeypatch):
     monkeypatch.setattr(assistant_graph, "settings", _fake_settings())
 
     model = assistant_graph._chat_model()
 
+    assert model.use_responses_api is True
+    assert model.reasoning == {"summary": "auto", "effort": "minimal"}
+    # Prompts and reasoning summaries must not be stored server-side.
+    assert model.store is False
+
+
+def test_chat_model_can_turn_thinking_off(monkeypatch):
+    monkeypatch.setattr(
+        assistant_graph,
+        "settings",
+        _fake_settings(llm_reasoning_summary="off"),
+    )
+
+    model = assistant_graph._chat_model()
+
+    # Falls back to Chat Completions (no reasoning display) but keeps the
+    # latency fix.
+    assert not model.use_responses_api
     assert model.reasoning_effort == "minimal"
 
 
-def test_chat_model_omits_reasoning_effort_for_classic_models(monkeypatch):
+def test_chat_model_omits_reasoning_settings_for_classic_models(monkeypatch):
     monkeypatch.setattr(
         assistant_graph,
         "settings",
@@ -61,7 +80,64 @@ def test_chat_model_omits_reasoning_effort_for_classic_models(monkeypatch):
 
     model = assistant_graph._chat_model()
 
+    assert not model.use_responses_api
     assert model.reasoning_effort is None
+    assert model.reasoning is None
+
+
+def test_split_stream_chunk_separates_thinking_from_answer():
+    from langchain_core.messages import AIMessageChunk
+
+    chunk = AIMessageChunk(
+        content=[
+            {"type": "reasoning", "summary": [{"type": "summary_text", "text": "weighing "}]},
+            {"type": "reasoning", "summary": [{"type": "summary_text", "text": "options"}]},
+            {"type": "text", "text": "Hello"},
+            {"type": "text", "text": " there"},
+        ]
+    )
+
+    reasoning, answer = assistant_graph.split_stream_chunk(chunk)
+
+    assert reasoning == "weighing options"
+    assert answer == "Hello there"
+
+
+def test_split_stream_chunk_handles_plain_string_and_none():
+    from langchain_core.messages import AIMessageChunk
+
+    assert assistant_graph.split_stream_chunk(AIMessageChunk(content="hi")) == ("", "hi")
+    assert assistant_graph.split_stream_chunk(None) == ("", "")
+
+
+def test_split_stream_chunk_ignores_tool_call_blocks():
+    from langchain_core.messages import AIMessageChunk
+
+    chunk = AIMessageChunk(
+        content=[],
+        additional_kwargs={"tool_calls": [{"id": "c1", "function": {"name": "x", "arguments": "{}"}}]},
+    )
+
+    assert assistant_graph.split_stream_chunk(chunk) == ("", "")
+
+
+def test_connected_provider_picks_google_then_teams():
+    pick = assistant_graph.pick_connected_meeting_provider
+
+    assert pick({"gmail", "google_calendar"}) == "google_meet"
+    assert pick({"google_meet"}) == "google_meet"
+    # Google wins when both are connected (a Meet link works for any invitee).
+    assert pick({"microsoft_teams", "google_calendar"}) == "google_meet"
+    assert pick({"microsoft_teams"}) == "microsoft_teams"
+    assert pick({"gmail"}) is None
+
+
+def test_provider_hint_reads_the_recruiters_words():
+    hint = assistant_graph.provider_hint_from_message
+
+    assert hint("Teams failed, switch to Google Meet") == "google_meet"
+    assert hint("let's use teams please") == "microsoft_teams"
+    assert hint("schedule it for tomorrow at 3pm") is None
 
 
 class _FakeResponse:

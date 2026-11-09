@@ -101,6 +101,11 @@ class Settings(BaseSettings):
     # The provider default spent 30s+ per agent call on gpt-5-nano; "low" keeps
     # the same tool choices at a fraction of the latency. Empty = provider default.
     llm_reasoning_effort: str = "low"
+    # Streaming "thinking" for reasoning models. ``auto`` asks the OpenAI
+    # Responses API for a human-readable reasoning summary and streams it to the
+    # chat UI (the raw chain of thought is never exposed by the provider). Set to
+    # "off" to stay on Chat Completions and show no thinking panel.
+    llm_reasoning_summary: str = "auto"
 
     # composio — the only external tool layer (Gmail + Microsoft Teams).
     # Auth configs are resolved (or created) per toolkit at connect time, so no

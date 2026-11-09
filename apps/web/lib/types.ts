@@ -305,6 +305,7 @@ export interface ChatPayload {
   intent: string;
   message: string;
   reply?: string;
+  reasoning?: string | null;
   data: Record<string, unknown>;
   candidates: CandidateSummary[];
   pending_actions: PendingAction[];

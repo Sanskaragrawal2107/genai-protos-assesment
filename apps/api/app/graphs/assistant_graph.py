@@ -26,6 +26,7 @@ from ..db import (
     candidates,
     chat_messages,
     chat_threads,
+    connected_accounts,
     jobs,
     pending_actions,
     utcnow,
@@ -35,7 +36,6 @@ from ..repo import (
     candidate_summary,
     create_pending_action,
     list_candidates,
-    meeting_provider_for,
     normalize_meeting_provider,
     set_candidate_status,
     to_jsonable,
@@ -167,7 +167,11 @@ AGENT_TOOLS = [
                     "meeting_provider": {
                         "type": "string",
                         "enum": ["microsoft_teams", "google_meet"],
-                        "description": "Video meeting provider. Defaults to the workspace's configured provider. Pass google_meet whenever the recruiter asks to use or switch to Google Meet.",
+                        "description": (
+                            "The video platform the recruiter actually asked for. Use google_meet "
+                            "whenever they say Google Meet / Meet / gmeet, microsoft_teams when they "
+                            "say Teams. Leave empty only if the recruiter never mentioned a platform."
+                        ),
                     },
                     "title": {"type": "string", "description": "Title of the interview"},
                 },
@@ -325,7 +329,8 @@ CRITICAL INSTRUCTIONS & RECRUITER POLICIES:
    - When asked to schedule an interview or create a meeting link (Teams or Google Meet):
      - If date and time is NOT provided: ASK the recruiter for their preferred date and time (e.g. "What date and time would you like to schedule the interview for?").
      - If date and time IS provided (e.g. "make a meeting link on the 12th of November at 4 pm"):
-       - IMMEDIATELY call `schedule_interview` with candidate_name_or_id, time_expression, and preferred meeting_provider (microsoft_teams or google_meet).
+       - IMMEDIATELY call `schedule_interview` with candidate_name_or_id, time_expression, and the EXACT `meeting_provider` the recruiter asked for (google_meet for "Google Meet"/"Meet", microsoft_teams for "Teams"). Never substitute a different platform and never fall back to a workspace default.
+       - The platform is whatever the recruiter said in this conversation. If they never named one, call the tool without `meeting_provider` and use the platform it actually returns; do not assume Teams.
        - In your final response:
          1. State clearly that the interview is confirmed and scheduled.
          2. Provide the exact date, time, and timezone (e.g. Thursday, 12 November 2026 at 4:00 PM IST).
@@ -462,6 +467,33 @@ def provider_hint_from_message(message: str | None) -> str | None:
     if _MEET_SWITCH_RE.search(text):
         return "google_meet"
     if _TEAMS_SWITCH_RE.search(text):
+        return "microsoft_teams"
+    return None
+
+
+async def _connected_meeting_provider(session: AsyncSession, workspace_id: str) -> str | None:
+    """Platform to use when the recruiter did not name one.
+
+    Deliberately ignores any workspace-level default: a stored default is what
+    made a "use Google Meet" turn try Teams first (10s+ wasted). Google wins
+    when both are connected because a Meet link is usable by any invitee.
+    """
+    rows = (
+        await session.execute(
+            sa.select(connected_accounts.c.provider).where(
+                connected_accounts.c.workspace_id == workspace_id,
+                connected_accounts.c.status == "active",
+            )
+        )
+    ).scalars().all()
+    return pick_connected_meeting_provider({str(provider) for provider in rows})
+
+
+def pick_connected_meeting_provider(connected: set[str] | frozenset[str]) -> str | None:
+    """Map connected toolkit names onto a meeting provider (pure, testable)."""
+    if connected & {"google_meet", "google_calendar"}:
+        return "google_meet"
+    if "microsoft_teams" in connected:
         return "microsoft_teams"
     return None
 
@@ -643,17 +675,21 @@ async def execute_tool_call(
             return {"error": f"Could not parse '{time_str}'. Ask the recruiter for a specific date and time."}
 
         duration = int(args.get("duration_minutes") or 30)
-        # An explicit provider from the recruiter always wins (this is what makes
-        # "switch to Google Meet" actually switch). When it is omitted we use the
-        # workspace setting instead of hard-coding Teams, so a workspace configured
-        # for Google Meet is never silently forced back onto Teams.
+        # The recruiter's own words decide the platform. There is deliberately no
+        # workspace-wide default here: a stored default is what made a
+        # "use Google Meet" turn try Teams first and burn 10s on a broken account.
         raw_provider = (args.get("meeting_provider") or "").strip()
         if raw_provider:
             provider = normalize_meeting_provider(raw_provider)
         else:
-            provider = await meeting_provider_for(session, workspace_id)
-        if provider == "none":
-            provider = "microsoft_teams"
+            provider = await _connected_meeting_provider(session, workspace_id)
+        if not provider:
+            return {
+                "error": (
+                    "No video meeting app is connected for this workspace. Ask the recruiter "
+                    "which platform to use (Google Meet or Microsoft Teams) and connect it first."
+                )
+            }
 
         payload = {
             "candidate_id": cand["id"],
@@ -1193,13 +1229,61 @@ def _chat_model() -> ChatOpenAI:
         # provider default spent 30s+ per planning call, while "low" produced the
         # same tool choices in ~7s (and "minimal" in ~2s).
         effort = (settings.llm_reasoning_effort or "").strip().lower()
-        if effort:
+        summary = (settings.llm_reasoning_summary or "").strip().lower()
+        if summary and summary != "off":
+            # The Responses API is the only supported way to stream a reasoning
+            # summary (the provider never returns the raw chain of thought), and
+            # it rejects ``temperature``. ``store=False`` keeps prompts and
+            # reasoning summaries out of server-side storage.
+            kwargs.pop("temperature", None)
+            kwargs["use_responses_api"] = True
+            kwargs["store"] = False
+            reasoning: dict[str, Any] = {"summary": summary}
+            if effort:
+                reasoning["effort"] = effort
+            kwargs["reasoning"] = reasoning
+        elif effort:
             kwargs["reasoning_effort"] = effort
     return ChatOpenAI(**kwargs)
 
 
 def _build_agent(tools: list[Any], *, system_prompt: str = SYSTEM_PROMPT) -> Any:
     return create_agent(model=_chat_model(), tools=tools, system_prompt=system_prompt)
+
+
+def split_stream_chunk(chunk: Any) -> tuple[str, str]:
+    """Split one streamed chunk into ``(reasoning_text, answer_text)``.
+
+    Chat Completions streams plain strings. The Responses API streams content
+    blocks, where a reasoning summary arrives as
+    ``{"type": "reasoning", "summary": [{"type": "summary_text", "text": ...}]}``
+    and the visible answer as ``{"type": "text", "text": ...}``. Tool-call blocks
+    carry neither and are ignored here (LangChain emits them separately).
+    """
+    content = getattr(chunk, "content", None)
+    if content is None:
+        return "", ""
+    if isinstance(content, str):
+        return "", content
+    if not isinstance(content, list):
+        return "", str(content)
+
+    reasoning_parts: list[str] = []
+    answer_parts: list[str] = []
+    for part in content:
+        if not isinstance(part, dict):
+            answer_parts.append(str(part))
+            continue
+        part_type = part.get("type")
+        if part_type == "reasoning":
+            for item in part.get("summary") or []:
+                if isinstance(item, dict):
+                    reasoning_parts.append(str(item.get("text") or ""))
+                else:
+                    reasoning_parts.append(str(item))
+        elif part_type in (None, "text"):
+            answer_parts.append(str(part.get("text") or ""))
+    return "".join(reasoning_parts), "".join(answer_parts)
 
 
 # ---------------------------------------------------------------- job context
@@ -1322,6 +1406,7 @@ async def run_assistant_stream(
     accumulated_connections: list[dict[str, Any]] = []
     seen_connections: set[str] = set()
     final_reply: str = ""
+    reasoning_text: str = ""
 
     # Step indicator for the agent turn
     yield {
@@ -1430,11 +1515,10 @@ async def run_assistant_stream(
 
             if kind == "on_chat_model_stream":
                 chunk = event.get("data", {}).get("chunk")
-                text = getattr(chunk, "content", None)
-                if isinstance(text, list):
-                    text = "".join(
-                        part.get("text", "") if isinstance(part, dict) else str(part) for part in text
-                    )
+                reasoning_delta, text = split_stream_chunk(chunk)
+                if reasoning_delta:
+                    reasoning_text += reasoning_delta
+                    yield {"type": "reasoning", "text": reasoning_delta}
                 if text:
                     streamed = True
                     final_reply += text
@@ -1444,13 +1528,12 @@ async def run_assistant_stream(
                 # Some OpenAI-compatible proxies do not stream tokens; keep the
                 # final answer from the model-end event in that case.
                 out = event.get("data", {}).get("output")
-                content = getattr(out, "content", None)
-                if isinstance(content, list):
-                    content = "".join(
-                        part.get("text", "") if isinstance(part, dict) else str(part) for part in content
-                    )
+                reasoning_delta, content = split_stream_chunk(out)
+                if reasoning_delta and not reasoning_text:
+                    reasoning_text += reasoning_delta
+                    yield {"type": "reasoning", "text": reasoning_delta}
                 if content:
-                    final_reply = str(content)
+                    final_reply = content
 
             elif kind == "on_tool_start":
                 started_at[run_id] = time.perf_counter()
@@ -1524,9 +1607,13 @@ async def run_assistant_stream(
         }
 
     # 4. Save assistant message with structured payload
+    payload_data: dict[str, Any] = {}
+    if reasoning_text.strip():
+        # Kept bounded: this is a reasoning summary, not the transcript.
+        payload_data["reasoning"] = reasoning_text.strip()[:8000]
     payload = to_jsonable({
         "intent": "conversational_turn",
-        "data": {},
+        "data": payload_data,
         "candidates": accumulated_candidates,
         "pending_actions": accumulated_pending,
         "connections": accumulated_connections,
@@ -1553,6 +1640,7 @@ async def run_assistant_stream(
         "thread_id": thread_id,
         "message": final_reply,
         "reply": final_reply,
+        "reasoning": payload_data.get("reasoning"),
         "candidates": accumulated_candidates,
         "pending_actions": accumulated_pending,
         "connections": accumulated_connections,
