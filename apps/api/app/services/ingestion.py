@@ -35,6 +35,7 @@ from ..db import (
     candidate_applications,
     candidate_communications,
     candidates,
+    connected_accounts,
     email_attachments,
     email_messages,
     inbox_sync_settings,
@@ -758,11 +759,21 @@ async def run_job(
 
 
 async def due_accounts(session: AsyncSession, *, limit: int = 20) -> list[dict[str, Any]]:
+    """Inboxes whose ``next_sync_at`` is due and whose account is still active.
+
+    Joining ``connected_accounts`` prevents syncing a revoked/replaced account
+    (which would otherwise enqueue a job that can only fail).
+    """
     now = utcnow()
     stmt = (
         sa.select(inbox_sync_settings)
+        .join(
+            connected_accounts,
+            connected_accounts.c.id == inbox_sync_settings.c.connected_account_id,
+        )
         .where(
             inbox_sync_settings.c.enabled.is_(True),
+            connected_accounts.c.status == "active",
             sa.or_(inbox_sync_settings.c.next_sync_at.is_(None), inbox_sync_settings.c.next_sync_at <= now),
         )
         .order_by(inbox_sync_settings.c.next_sync_at.asc())

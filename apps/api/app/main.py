@@ -1,12 +1,15 @@
 """FastAPI entrypoint (production-only).
 
-There is no in-process scheduler and no demo mode: scheduled ingestion runs via
-pg_cron -> Supabase Edge Functions -> ``/internal/cron/tick``. The manual
-"Sync now" endpoint remains for operators. At boot the process validates every
-required setting and fails fast if anything is missing.
+Scheduled ingestion runs through one ``tick`` function. A single API instance
+runs it in-process (``SCHEDULER_INPROCESS``, default on); Supabase pg_cron can
+drive the same tick over ``/internal/cron/tick`` when the Vault secrets and a
+public API URL are configured. The manual "Sync now" endpoint remains for
+operators. At boot the process validates every required setting and fails fast
+if anything is missing.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
@@ -29,21 +32,59 @@ logging.basicConfig(
 )
 log = logging.getLogger("recruiter")
 
+_scheduler_task: asyncio.Task | None = None
+
+
+async def _scheduler_loop() -> None:
+    """Run one scheduler tick every ``scheduler_tick_seconds``.
+
+    This calls the same :func:`app.services.scheduler.tick` that Supabase cron
+    would call, so there is a single behaviour. A failed tick is logged and the
+    loop keeps running; it never crashes the API.
+    """
+    from .services.scheduler import tick
+
+    interval = max(10, settings.scheduler_tick_seconds)
+    log.info("in-process scheduler started (every %ss)", interval)
+    while True:
+        try:
+            async with session() as db:
+                result = await tick(db, worker_id="inprocess", max_jobs=5)
+            if result.get("enqueued") or result.get("processed"):
+                log.info(
+                    "scheduler tick: enqueued=%s processed=%s",
+                    len(result.get("enqueued") or []),
+                    len(result.get("processed") or []),
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - keep the loop alive
+            log.exception("scheduler tick failed")
+        await asyncio.sleep(interval)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _scheduler_task
     settings.validate_runtime()
     await init_db()
     log.info(
-        "AI Recruiter OS %s | db=postgres | llm=%s | composio=%s | storage=%s | scheduler=pg_cron",
+        "AI Recruiter OS %s | db=postgres | llm=%s | composio=%s | storage=%s | scheduler=%s",
         __version__,
         "on" if settings.llm_enabled else "heuristic",
         "on" if settings.composio_enabled else "off",
         storage.backend,
+        "in-process" if settings.scheduler_inprocess else "pg_cron",
     )
+    if settings.scheduler_inprocess:
+        _scheduler_task = asyncio.create_task(_scheduler_loop(), name="inprocess-scheduler")
     try:
         yield
     finally:
+        if _scheduler_task is not None:
+            _scheduler_task.cancel()
+            await asyncio.gather(_scheduler_task, return_exceptions=True)
+            _scheduler_task = None
         await close_client()
         await reset_engine()
 
@@ -86,7 +127,7 @@ async def health() -> dict[str, object]:
         "llm": settings.llm_enabled,
         "composio": settings.composio_enabled,
         "storage": storage.backend,
-        "scheduler": "pg_cron",
+        "scheduler": "in-process" if settings.scheduler_inprocess else "pg_cron",
     }
 
 

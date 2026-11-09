@@ -126,7 +126,13 @@ export default function SyncSettingsPage() {
                 <span className="badge-green">{settings.data?.connected_email || "Gmail"}</span>
                 <StatusBadge status={settings.data?.connector_status} />
                 <span className="text-[#8a8a93]">Last synced {formatDateTime(current?.last_synced_at)}</span>
-                <span className="text-[#8a8a93]">Next {timeFromNow(current?.next_sync_at)}</span>
+                <span className="text-[#8a8a93]">
+                  {!current?.enabled
+                    ? "Automatic sync off"
+                    : current?.next_sync_at && new Date(current.next_sync_at).getTime() <= Date.now()
+                      ? "Next sync overdue"
+                      : `Next ${timeFromNow(current?.next_sync_at)}`}
+                </span>
                 {current?.last_sync_status ? <StatusBadge status={current.last_sync_status} /> : null}
                 {current?.consecutive_failures ? (
                   <span className="text-[#9a6a1f]">{current.consecutive_failures} consecutive failures</span>

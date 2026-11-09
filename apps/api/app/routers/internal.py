@@ -27,9 +27,7 @@ router = APIRouter(prefix="/internal", dependencies=[Depends(require_internal)])
 async def cron_tick(max_jobs: int = 5) -> dict[str, Any]:
     """One scheduler pass: enqueue due inboxes and drain due jobs."""
     async with session() as db:
-        result = await tick(db, worker_id="supabase-cron")
-        result["processed"] = result["processed"][:max_jobs]
-        return result
+        return await tick(db, worker_id="supabase-cron", max_jobs=min(max(max_jobs, 1), 20))
 
 
 @router.post("/sync/{account_id}")

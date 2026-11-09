@@ -8,10 +8,12 @@ from app import db as db_module
 from app.composio import IntegrationError
 from app.db import (
     candidates,
+    connected_accounts,
     email_attachments,
     email_messages,
     ingestion_jobs,
     inbox_sync_settings,
+    utcnow,
 )
 from app.graphs.ingestion_graph import run_ingestion
 from app.services import ingestion as ing
@@ -23,6 +25,52 @@ async def _job(db, workspace):
     return await ing.enqueue_job(
         db, workspace_id=workspace["workspace_id"], account_id=workspace["account_id"], trigger="manual"
     )
+
+
+async def test_due_accounts_skips_revoked_account(db, workspace):
+    """A revoked account must never be synced, even if its sync row is due.
+
+    Otherwise the scheduler would repeatedly enqueue jobs that can only fail,
+    and a revoked account could shadow the active one.
+    """
+    now = utcnow()
+    revoked_id = db_module.new_id()
+    await db.execute(
+        sa.insert(connected_accounts).values(
+            id=revoked_id,
+            workspace_id=workspace["workspace_id"],
+            recruiter_id="tester",
+            provider="gmail",
+            connected_email="old@example.com",
+            status="revoked",
+            scopes=[],
+            created_at=now,
+            updated_at=now,
+        )
+    )
+    await db.execute(
+        sa.insert(inbox_sync_settings).values(
+            id=db_module.new_id(),
+            workspace_id=workspace["workspace_id"],
+            connected_account_id=revoked_id,
+            enabled=True,
+            interval_minutes=30,
+            is_custom_interval=False,
+            query="newer_than:2d",
+            next_sync_at=now,  # due now
+            consecutive_failures=0,
+            overlap_minutes=60,
+            created_at=now,
+            updated_at=now,
+        )
+    )
+    await db.commit()
+
+    due = await ing.due_accounts(db)
+    account_ids = {row["connected_account_id"] for row in due}
+
+    assert workspace["account_id"] in account_ids
+    assert revoked_id not in account_ids
 
 
 async def test_first_sync_imports_candidates(db, workspace):

@@ -175,7 +175,17 @@ scheduling fail honestly with "not connected" / "not configured" errors.
 
 ## 7. Optional: scheduled ingestion
 
-In the cloud, `pg_cron` calls the two Edge Functions every minute. To enable it:
+By default the API runs the scheduler in-process: on startup it starts a loop
+that calls `scheduler.tick()` every `SCHEDULER_TICK_SECONDS` (default 60). This
+is the simplest working setup for a single instance:
+
+```bash
+SCHEDULER_INPROCESS=true      # default
+SCHEDULER_TICK_SECONDS=60
+```
+
+For the database-driven alternative, set `SCHEDULER_INPROCESS=false` and let
+`pg_cron` call the two Edge Functions every minute:
 
 ```bash
 supabase functions deploy scheduler     --project-ref <ref>
@@ -194,8 +204,8 @@ select vault.create_secret('https://<ref>.supabase.co', 'supabase_project_url');
 select vault.create_secret('<service-role-key>', 'supabase_service_role_key');
 ```
 
-For a purely local API, skip pg_cron (the Edge Functions cannot reach
-`127.0.0.1`). Use **Sync inbox now** in the UI, or trigger the tick manually:
+For a purely local API, keep the default in-process scheduler (no Edge
+Function can reach `127.0.0.1`). You can also trigger one tick manually:
 
 ```bash
 curl -X POST http://127.0.0.1:8000/internal/cron/tick \

@@ -86,8 +86,11 @@ Start command:
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-Scheduling is owned by pg_cron (see section 5); the API exposes only the
-idempotent internal tick endpoints.
+The API runs the scheduler tick in-process (`SCHEDULER_INPROCESS`, default
+`true`), so a single long-running instance keeps automatic ingestion working
+with no extra infrastructure. The idempotent `/internal/cron/tick` endpoint
+stays available for pg_cron (section 5); set `SCHEDULER_INPROCESS=false` before
+enabling that path so two schedulers do not run at once.
 
 ## 3. Web
 
@@ -124,9 +127,12 @@ Both are deployed with `verify_jwt=true`, so only a privileged caller (the
 service-role JWT used by `pg_cron`) can invoke them. Without the secrets they
 return `503` with a descriptive message — they never pretend to have run.
 
-## 5. Scheduled jobs (pg_cron)
+## 5. Optional: scheduled jobs (pg_cron)
 
-`0003_cron.sql` schedules three jobs:
+By default the API schedules ingestion itself (`SCHEDULER_INPROCESS=true`).
+The pg_cron path is an alternative for deployments that prefer the database to
+drive the heartbeat: set `SCHEDULER_INPROCESS=false`, then `0003_cron.sql`
+schedules three jobs:
 
 | Job | Schedule | Action |
 | --- | --- | --- |
@@ -159,7 +165,7 @@ limit 20;
 - [ ] Migrations applied; `select count(*) from storage.buckets where id='resumes'` returns 1.
 - [ ] API reachable over HTTPS and boots with production validation passing; `DATABASE_URL` points at Supabase Postgres.
 - [ ] `API_INTERNAL_TOKEN` identical in the API and both Edge Functions.
-- [ ] Vault secrets created; `cron.job` shows 3 jobs; `job_run_details` shows successes.
+- [ ] Vault secrets created; `cron.job` shows 3 jobs; `job_run_details` shows successes. (Or leave pg_cron disabled and confirm `/health` reports `"scheduler":"in-process"`.)
 - [ ] Web build points at the deployed API and Supabase project.
 - [ ] Settings → Integrations shows Gmail plus at least one meeting provider (Microsoft Teams or Google Calendar/Meet) `active` after OAuth.
 - [ ] A test interview produces a real Teams join URL or Google Meet link; Google events are visible on the connected calendar and the Gmail draft is queued.

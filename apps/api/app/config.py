@@ -126,6 +126,11 @@ class Settings(BaseSettings):
     sync_max_attempts: int = 4
     sync_overlap_minutes: int = 60
     sync_max_resume_bytes: int = 10 * 1024 * 1024
+    # Run the scheduler tick inside the API process. This is the working path for
+    # a single-instance deployment (and local dev); set SCHEDULER_INPROCESS=false
+    # when Supabase pg_cron is fully wired up (Vault secrets + public API URL).
+    scheduler_inprocess: bool = True
+    scheduler_tick_seconds: int = 60
     default_timezone: str = "Asia/Kolkata"
     working_hours_start: int = 9
     working_hours_end: int = 19

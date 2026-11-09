@@ -105,9 +105,11 @@ Teams and Google MCP tools under the `composio` namespace.
 ### 1. Resume ingestion
 
 ```
-pg_cron ─▶ Edge Function "scheduler" ─▶ POST /internal/cron/tick
-   tick(): find inbox_sync_settings where next_sync_at <= now
-           ─▶ enqueue ingestion_jobs ─▶ process job
+API process (in-process scheduler, default) ─┐
+                                              ├─▶ tick(): find inbox_sync_settings
+pg_cron ─▶ Edge Function "scheduler" ────────┘     where next_sync_at <= now
+             ─▶ POST /internal/cron/tick            and the account is active
+              ─▶ enqueue ingestion_jobs ─▶ process job
               ─▶ Composio GMAIL_FETCH_EMAILS (quad-based query)
               ─▶ GMAIL_GET_ATTACHMENT ─▶ store in resumes bucket
               ─▶ parse resume ─▶ upsert candidate ─▶ record application
