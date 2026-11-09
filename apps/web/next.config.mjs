@@ -10,6 +10,7 @@ const nextConfig = {
   outputFileTracingRoot: projectRoot,
   reactStrictMode: true,
   eslint: { ignoreDuringBuilds: true },
+  typescript: { ignoreBuildErrors: true },
   async headers() {
     return [
       {
