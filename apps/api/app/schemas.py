@@ -232,6 +232,9 @@ class ScheduleRequest(BaseModel):
 class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=4000)
     thread_id: str | None = None
+    # Optional job description attached as context for this message. The client
+    # re-sends it on each message while it stays attached in the composer.
+    job_id: str | None = None
 
 
 # ---------------------------------------------------------------- connector

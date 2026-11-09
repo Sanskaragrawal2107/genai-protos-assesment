@@ -6,6 +6,7 @@ import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from "rea
 import {
   ArrowRight,
   ArrowUp,
+  Briefcase,
   Check,
   CheckCheck,
   ChevronDown,
@@ -22,11 +23,12 @@ import {
   Square,
   Trash2,
   Users,
+  X,
   XCircle,
 } from "lucide-react";
 import { api, apiStream, ApiError } from "@/lib/api";
 import { humanize, timeFromNow } from "@/lib/format";
-import type { CandidateSummary, ChatPayload, PendingAction, AppConnection } from "@/lib/types";
+import type { CandidateSummary, ChatPayload, PendingAction, AppConnection, Job } from "@/lib/types";
 import { PendingActions } from "@/components/PendingActions";
 import { MarkdownMessage } from "@/components/MarkdownMessage";
 import { Alert, Avatar, Spinner } from "@/components/ui";
@@ -59,6 +61,7 @@ interface Turn {
   id: string;
   role: "user" | "assistant";
   text: string;
+  jobTitle?: string;
   candidates?: AssistantCandidate[];
   pending?: PendingAction[];
   connections?: AppConnection[];
@@ -86,6 +89,8 @@ interface ThreadMessage {
     candidates?: AssistantCandidate[];
     pending_actions?: PendingAction[];
     connections?: AppConnection[];
+    job_id?: string;
+    job_title?: string;
   } | null;
   created_at?: string;
 }
@@ -151,12 +156,27 @@ function AssistantInner() {
   const [busy, setBusy] = useState(false);
   const [restoring, setRestoring] = useState(false);
 
+  // Job-description context attached to the composer
+  const [jobs, setJobs] = useState<Job[]>([]);
+  const [jobsLoading, setJobsLoading] = useState(false);
+  const [jobPickerOpen, setJobPickerOpen] = useState(false);
+  const [jobQuery, setJobQuery] = useState("");
+  const [selectedJob, setSelectedJob] = useState<{ id: string; title: string } | null>(null);
+
   const endRef = useRef<HTMLDivElement | null>(null);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
   const bootstrapped = useRef(false);
 
   const streaming = turns.some((turn) => turn.streaming);
+
+  const filteredJobs = useMemo(() => {
+    const q = jobQuery.trim().toLowerCase();
+    if (!q) return jobs;
+    return jobs.filter((job) =>
+      `${job.title} ${job.description ?? ""}`.toLowerCase().includes(q),
+    );
+  }, [jobs, jobQuery]);
 
   useEffect(() => {
     if (window.matchMedia("(max-width: 767px)").matches) setSidebarOpen(false);
@@ -193,6 +213,35 @@ function AssistantInner() {
     loadThreads();
   }, [loadThreads]);
 
+  const loadJobs = useCallback(async () => {
+    setJobsLoading(true);
+    try {
+      const res = await api<Job[]>("/api/jobs");
+      if (Array.isArray(res)) setJobs(res);
+    } catch {
+      // Non-critical: the composer still works without a JD attached.
+    } finally {
+      setJobsLoading(false);
+    }
+  }, []);
+
+  function openJobPicker() {
+    if (jobPickerOpen) {
+      setJobPickerOpen(false);
+      return;
+    }
+    setJobPickerOpen(true);
+    setJobQuery("");
+    void loadJobs();
+  }
+
+  function attachJob(job: Job) {
+    setSelectedJob({ id: job.id, title: job.title });
+    setJobPickerOpen(false);
+    setJobQuery("");
+    inputRef.current?.focus();
+  }
+
   // Load a specific thread
   const selectThread = useCallback(
     async (threadId: string, threadTitle?: string) => {
@@ -213,6 +262,7 @@ function AssistantInner() {
             id: message.id || `h-${index}`,
             role: message.role === "user" ? "user" : "assistant",
             text: message.content,
+            jobTitle: message.payload?.job_title,
             intent: message.payload?.intent,
             candidates: message.payload?.candidates,
             pending: message.payload?.pending_actions,
@@ -220,6 +270,21 @@ function AssistantInner() {
             data: message.payload?.data,
           })),
         );
+
+        // Restore the JD attached to the most recent user message. If that
+        // message had no JD, the chip stays empty (removal is honoured).
+        const lastUserMessage = [...messages]
+          .reverse()
+          .find((message) => message.role === "user");
+        setSelectedJob(
+          lastUserMessage?.payload?.job_id
+            ? {
+                id: lastUserMessage.payload.job_id,
+                title: lastUserMessage.payload.job_title || "Attached JD",
+              }
+            : null,
+        );
+        setJobPickerOpen(false);
 
         if (!threadTitle && !Array.isArray(data) && (data?.thread as any)?.title) {
           setActiveThreadTitle((data.thread as any).title);
@@ -281,6 +346,8 @@ function AssistantInner() {
     setActiveThreadTitle("New Session");
     setTurns([]);
     setInput("");
+    setSelectedJob(null);
+    setJobPickerOpen(false);
     setBusy(false);
   }
 
@@ -290,10 +357,11 @@ function AssistantInner() {
     if (!text || busy) return;
 
     setInput("");
+    const jobContext = selectedJob;
     const assistantId = `a-${Date.now()}`;
     setTurns((current) => [
       ...current,
-      { id: `u-${Date.now()}`, role: "user", text },
+      { id: `u-${Date.now()}`, role: "user", text, jobTitle: jobContext?.title },
       { id: assistantId, role: "assistant", text: "", steps: [], streaming: true },
     ]);
     setBusy(true);
@@ -306,7 +374,7 @@ function AssistantInner() {
 
     try {
       await apiStream("/api/chat/stream", {
-        body: { message: text, thread_id: activeThreadId ?? null },
+        body: { message: text, thread_id: activeThreadId ?? null, job_id: jobContext?.id ?? null },
         signal: controller.signal,
         onEvent: ({ event, data }) => {
           if (event === "meta") {
@@ -664,8 +732,16 @@ function AssistantInner() {
             <div key={turn.id} className="mb-7 last:mb-0">
               {turn.role === "user" ? (
                 <div className="flex justify-end">
-                  <div className="max-w-[85%] whitespace-pre-wrap rounded-[9px] border border-[#ececea] bg-[#f7f7f4] px-3.5 py-2.5 text-[13px] leading-6 text-[#27272a] sm:max-w-[75%]">
-                    {turn.text}
+                  <div className="max-w-[85%] rounded-[9px] border border-[#ececea] bg-[#f7f7f4] px-3.5 py-2.5 text-[13px] leading-6 text-[#27272a] sm:max-w-[75%]">
+                    {turn.jobTitle ? (
+                      <div className="mb-1.5 flex">
+                        <span className="inline-flex max-w-full items-center gap-1 rounded-[5px] border border-[#d9e5df] bg-white px-1.5 py-0.5 text-[10px] font-medium text-[#1f4b3f]">
+                          <Briefcase size={10} className="shrink-0" />
+                          <span className="min-w-0 truncate">{turn.jobTitle}</span>
+                        </span>
+                      </div>
+                    ) : null}
+                    <div className="whitespace-pre-wrap">{turn.text}</div>
                   </div>
                 </div>
               ) : (
@@ -749,6 +825,23 @@ function AssistantInner() {
             className="mx-auto w-full max-w-[780px]"
           >
             <div className="rounded-[12px] border border-[#e0e0dc] bg-white p-2 shadow-[0_1px_2px_rgba(24,24,27,0.04)] transition-colors focus-within:border-[#1f4b3f] focus-within:ring-2 focus-within:ring-[#1f4b3f]/10">
+              {selectedJob ? (
+                <div className="flex px-2 pt-2">
+                  <span className="inline-flex max-w-full items-center gap-1.5 rounded-[6px] border border-[#d9e5df] bg-[#f3f8f5] px-2 py-1 text-[11px] font-medium text-[#1f4b3f]">
+                    <Briefcase size={11} className="shrink-0" />
+                    <span className="min-w-0 truncate">{selectedJob.title}</span>
+                    <button
+                      type="button"
+                      onClick={() => setSelectedJob(null)}
+                      title="Remove JD context"
+                      className="ml-0.5 rounded-[4px] p-0.5 text-[#5d8a76] transition-colors hover:bg-[#e3efe8] hover:text-[#173a30]"
+                    >
+                      <X size={11} />
+                    </button>
+                  </span>
+                </div>
+              ) : null}
+
               <textarea
                 rows={1}
                 ref={inputRef}
@@ -764,12 +857,27 @@ function AssistantInner() {
                 className="block min-h-[38px] w-full resize-none border-0 bg-transparent px-2.5 py-2 text-[13.5px] leading-6 text-[#27272a] placeholder:text-[#a1a1aa] focus:outline-none focus:ring-0"
               />
 
-              <div className="flex items-center justify-between gap-2 px-1 pb-0.5 pt-0.5">
-                <p className="hidden pl-1.5 text-[10.5px] leading-4 text-[#a1a1aa] sm:block">
-                  Shift + Enter for a new line
-                </p>
+              <div className="relative flex items-center justify-between gap-2 px-1 pb-0.5 pt-0.5">
+                <div className="flex min-w-0 items-center gap-1">
+                  <button
+                    type="button"
+                    onClick={openJobPicker}
+                    title="Attach a job description as context for your message"
+                    className={`inline-flex h-7 shrink-0 items-center gap-1 rounded-[7px] px-2 text-[11.5px] font-medium transition-colors ${
+                      selectedJob
+                        ? "bg-[#f3f8f5] text-[#1f4b3f] hover:bg-[#e8f1ec]"
+                        : "text-[#71717a] hover:bg-[#f4f4f1] hover:text-[#27272a]"
+                    }`}
+                  >
+                    <Briefcase size={11} />
+                    <span>{selectedJob ? "Change JD" : "Add JD"}</span>
+                  </button>
+                  <p className="hidden truncate pl-1 text-[10.5px] leading-4 text-[#a1a1aa] sm:block">
+                    Shift + Enter for a new line
+                  </p>
+                </div>
 
-                <div className="ml-auto flex items-center gap-1.5">
+                <div className="flex shrink-0 items-center gap-1.5">
                   {busy && (
                     <button
                       type="button"
@@ -789,6 +897,84 @@ function AssistantInner() {
                     {busy ? <Loader2 size={13} className="animate-spin" /> : <ArrowUp size={14} />}
                   </button>
                 </div>
+
+                {jobPickerOpen ? (
+                  <>
+                    <div className="fixed inset-0 z-10" onClick={() => setJobPickerOpen(false)} />
+                    <div className="absolute bottom-full left-0 z-20 mb-2 w-[min(320px,calc(100vw-2rem))] overflow-hidden rounded-[10px] border border-[#e0e0dc] bg-white shadow-[0_12px_32px_rgba(24,24,27,0.14)]">
+                      <div className="border-b border-[#f0f0ec] p-2">
+                        <div className="flex items-center gap-1.5 rounded-[6px] border border-[#ececea] bg-[#fafaf9] px-2">
+                          <Search size={12} className="shrink-0 text-[#a1a1aa]" />
+                          <input
+                            autoFocus
+                            value={jobQuery}
+                            onChange={(e) => setJobQuery(e.target.value)}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter") {
+                                e.preventDefault();
+                                e.stopPropagation();
+                                if (filteredJobs[0]) attachJob(filteredJobs[0]);
+                              } else if (e.key === "Escape") {
+                                e.preventDefault();
+                                setJobPickerOpen(false);
+                              }
+                            }}
+                            placeholder="Search job descriptions…"
+                            className="h-7 w-full bg-transparent text-[12px] text-[#27272a] placeholder:text-[#a1a1aa] focus:outline-none"
+                          />
+                        </div>
+                      </div>
+                      <div className="max-h-[240px] overflow-y-auto p-1">
+                        {jobsLoading ? (
+                          <div className="flex items-center justify-center gap-2 py-6 text-[11.5px] text-[#8a8a93]">
+                            <Loader2 size={12} className="animate-spin" /> Loading jobs…
+                          </div>
+                        ) : filteredJobs.length === 0 ? (
+                          <div className="px-2 py-5 text-center">
+                            <p className="text-[11.5px] text-[#71717a]">
+                              {jobs.length === 0 ? "No job descriptions yet." : "No matches."}
+                            </p>
+                            {jobs.length === 0 ? (
+                              <Link
+                                href="/jobs"
+                                className="mt-1 inline-block text-[11.5px] font-medium text-[#1f4b3f] underline-offset-2 hover:underline"
+                              >
+                                Create a job description
+                              </Link>
+                            ) : null}
+                          </div>
+                        ) : (
+                          filteredJobs.map((job) => (
+                            <button
+                              key={job.id}
+                              type="button"
+                              onClick={() => attachJob(job)}
+                              className={`flex w-full items-start gap-2 rounded-[6px] px-2 py-1.5 text-left transition-colors hover:bg-[#f6f6f3] ${
+                                selectedJob?.id === job.id ? "bg-[#f3f8f5]" : ""
+                              }`}
+                            >
+                              <Briefcase size={12} className="mt-0.5 shrink-0 text-[#8a8a93]" />
+                              <span className="min-w-0 flex-1">
+                                <span className="block truncate text-[12px] font-medium text-[#27272a]">
+                                  {job.title}
+                                </span>
+                                <span className="mt-0.5 block text-[10.5px] text-[#a1a1aa]">
+                                  {job.status}
+                                  {typeof job.candidate_count === "number"
+                                    ? ` · ${job.candidate_count} candidates`
+                                    : ""}
+                                </span>
+                              </span>
+                              {selectedJob?.id === job.id ? (
+                                <Check size={12} className="mt-0.5 shrink-0 text-[#1f4b3f]" />
+                              ) : null}
+                            </button>
+                          ))
+                        )}
+                      </div>
+                    </div>
+                  </>
+                ) : null}
               </div>
             </div>
           </form>

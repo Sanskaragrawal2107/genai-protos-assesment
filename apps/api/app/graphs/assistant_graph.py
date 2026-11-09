@@ -26,6 +26,7 @@ from ..db import (
     candidates,
     chat_messages,
     chat_threads,
+    jobs,
     pending_actions,
     utcnow,
 )
@@ -473,6 +474,7 @@ async def execute_tool_call(
     recruiter_id: str | None,
     accumulated_candidates: list[dict[str, Any]],
     accumulated_pending: list[dict[str, Any]],
+    job_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if name == "search_candidates":
         query = (args.get("query") or "").strip()
@@ -480,6 +482,20 @@ async def execute_tool_call(
         location = args.get("location")
         min_exp = args.get("min_experience_years")
         status = args.get("status")
+
+        # Deterministic JD fallback: when a job is attached and the model omits
+        # filters, search against the job's structured requirements instead of
+        # returning the whole workspace.
+        if job_context:
+            requirements = job_context.get("structured_requirements") or {}
+            if not skills:
+                skills = list(requirements.get("required_skills") or []) + list(
+                    requirements.get("preferred_skills") or []
+                )
+            if not location:
+                location = requirements.get("required_location")
+            if min_exp is None:
+                min_exp = requirements.get("min_experience_years")
 
         filters: dict[str, Any] = {}
         if skills:
@@ -1090,6 +1106,7 @@ def _domain_tools(
     user_message: str,
     accumulated_candidates: list[dict[str, Any]],
     accumulated_pending: list[dict[str, Any]],
+    job_context: dict[str, Any] | None = None,
 ) -> list[Any]:
     """Expose the recruiter actions to LangChain.
 
@@ -1121,6 +1138,7 @@ def _domain_tools(
                 recruiter_id=recruiter_id,
                 accumulated_candidates=accumulated_candidates,
                 accumulated_pending=accumulated_pending,
+                job_context=job_context,
             )
             if not isinstance(result, dict):
                 result = {"status": "ok", "message": str(result)}
@@ -1147,6 +1165,52 @@ def _build_agent(tools: list[Any], *, system_prompt: str = SYSTEM_PROMPT) -> Any
     return create_agent(model=model, tools=tools, system_prompt=system_prompt)
 
 
+# ---------------------------------------------------------------- job context
+_MAX_JOB_DESCRIPTION_CHARS = 4000
+_MAX_JOB_REQUIREMENTS_CHARS = 2000
+
+
+async def _load_job(
+    session: AsyncSession, workspace_id: str, job_id: str | None
+) -> dict[str, Any] | None:
+    """Load a job description scoped to the workspace. Best-effort."""
+    if not job_id:
+        return None
+    row = (
+        await session.execute(
+            sa.select(jobs).where(jobs.c.id == job_id, jobs.c.workspace_id == workspace_id)
+        )
+    ).mappings().first()
+    return dict(row) if row else None
+
+
+def _job_context_block(job: dict[str, Any]) -> str:
+    """Render the attached JD as an unambiguous system-prompt block."""
+    requirements = job.get("structured_requirements") or {}
+    lines = [
+        "ATTACHED JOB DESCRIPTION (the recruiter attached this job to the conversation):",
+        f"- Job ID: {job['id']}",
+        f"- Title: {job['title']}",
+        f"- Status: {job.get('status') or 'open'}",
+    ]
+    if job.get("application_subject_prefix"):
+        lines.append(f"- Application subject prefix: {job['application_subject_prefix']}")
+    if requirements:
+        rendered = json.dumps(requirements, default=str)
+        lines.append(f"- Structured requirements: {rendered[:_MAX_JOB_REQUIREMENTS_CHARS]}")
+    description = (job.get("description") or "").strip()
+    if description:
+        lines.append("- Description:")
+        lines.append(description[:_MAX_JOB_DESCRIPTION_CHARS])
+    lines.append(
+        "Use this job as the target role for candidate search, comparison, evaluation, "
+        "outreach and interview scheduling unless the recruiter explicitly names another role. "
+        "Derive the search skills, location and experience from this JD. Never claim a candidate "
+        "matches this JD without evidence from their profile."
+    )
+    return "\n".join(lines)
+
+
 # --------------------------------------------------------------------- Streaming Turn Runner
 async def run_assistant_stream(
     *,
@@ -1155,6 +1219,7 @@ async def run_assistant_stream(
     recruiter_id: str | None,
     thread_id: str,
     user_message: str,
+    job_id: str | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     yield {"type": "meta", "thread_id": thread_id}
 
@@ -1177,7 +1242,11 @@ async def run_assistant_stream(
         )
         await session.commit()
 
-    # 1. Save user message to database
+    # 1. Resolve the JD attached to this turn. The client re-sends the attached
+    # job on each message, so removing the chip truly removes the context.
+    job = await _load_job(session, workspace_id, job_id)
+
+    # 2. Save user message to database (with the attached JD, for history).
     await session.execute(
         sa.insert(chat_messages).values(
             id=db_module.new_id(),
@@ -1185,13 +1254,13 @@ async def run_assistant_stream(
             thread_id=thread_id,
             role="user",
             content=user_message,
-            payload={},
+            payload=({"job_id": job["id"], "job_title": job["title"]} if job else {}),
             created_at=utcnow(),
         )
     )
     await session.commit()
 
-    # 2. Load previous conversation history for this thread
+    # 3. Load previous conversation history for this thread
     prior_rows = (
         await session.execute(
             sa.select(chat_messages)
@@ -1230,13 +1299,14 @@ async def run_assistant_stream(
     try:
         composio_session, composio_tools = await _composio(workspace_id)
         system_prompt = SYSTEM_PROMPT
+        if job:
+            system_prompt += "\n\n" + _job_context_block(job)
         if composio_session is not None:
             connected, missing = await asyncio.to_thread(_connection_status, composio_session)
             if missing:
                 missing_names = ", ".join(item["name"] for item in missing)
-                system_prompt = (
-                    SYSTEM_PROMPT
-                    + "\n\nAPP CONNECTIONS (Composio):\n"
+                system_prompt += (
+                    "\n\nAPP CONNECTIONS (Composio):\n"
                     + f"- Connected: {', '.join(_toolkit_name(s) for s in connected) or 'none'}\n"
                     + f"- Not connected: {missing_names}\n"
                     + "If the recruiter's request needs a not-connected app, call "
@@ -1252,6 +1322,7 @@ async def run_assistant_stream(
             user_message=user_message,
             accumulated_candidates=accumulated_candidates,
             accumulated_pending=accumulated_pending,
+            job_context=job,
         ) + composio_tools
         agent = _build_agent(tools, system_prompt=system_prompt)
 
@@ -1418,6 +1489,7 @@ async def run_assistant(
     recruiter_id: str | None,
     thread_id: str,
     user_message: str,
+    job_id: str | None = None,
 ) -> dict[str, Any]:
     final_payload: dict[str, Any] = {}
     async for event in run_assistant_stream(
@@ -1426,6 +1498,7 @@ async def run_assistant(
         recruiter_id=recruiter_id,
         thread_id=thread_id,
         user_message=user_message,
+        job_id=job_id,
     ):
         if event.get("type") == "done":
             final_payload = event

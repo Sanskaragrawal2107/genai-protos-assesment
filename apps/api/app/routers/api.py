@@ -1147,6 +1147,7 @@ async def chat(ctx: CtxDep, body: ChatRequest, thread_id: ThreadDep) -> dict[str
         recruiter_id=ctx.user_id,
         thread_id=thread_id,
         user_message=body.message,
+        job_id=body.job_id,
     )
     await ctx.session.execute(
         sa.update(chat_threads).where(chat_threads.c.id == thread_id).values(updated_at=utcnow())
@@ -1173,6 +1174,7 @@ async def chat_stream(
             recruiter_id=ctx.user_id,
             thread_id=thread_id,
             user_message=body.message,
+            job_id=body.job_id,
         ):
             yield ServerSentEvent(data=event, event=event["type"])
     except Exception as exc:  # noqa: BLE001
