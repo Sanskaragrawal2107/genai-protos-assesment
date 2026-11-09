@@ -185,10 +185,10 @@ AGENT_TOOLS = [
         "function": {
             "name": "verify_candidate",
             "description": (
-                "Verify candidate technical credentials: checks LeetCode (solved counts, ranking) and GitHub repositories. "
-                "It also fetches the candidate's personal website/portfolio and returns the page's visible text, headings/projects, "
-                "contact links, and any GitHub/LeetCode/LinkedIn profiles found there. If the recruiter supplies any profile URL "
-                "(leetcode_url / github_url / profile_url), pass it so it is saved on the candidate and actually checked."
+                "Verify candidate technical credentials: checks real LeetCode stats (problems solved, difficulty breakdown, "
+                "ranking) and GitHub repositories (public repos, top languages, recent activity). "
+                "The candidate's GitHub, LeetCode, and portfolio URLs are automatically retrieved from their record in the database. "
+                "You do NOT need the recruiter to provide URLs; only pass leetcode_url / github_url if the recruiter explicitly typed a new URL in their message."
             ),
             "parameters": {
                 "type": "object",
@@ -196,15 +196,15 @@ AGENT_TOOLS = [
                     "candidate_name_or_id": {"type": "string", "description": "Candidate name or UUID"},
                     "leetcode_url": {
                         "type": "string",
-                        "description": "LeetCode profile URL supplied by the recruiter, e.g. https://leetcode.com/u/<handle>/. Saved to the candidate and used for verification.",
+                        "description": "Optional: New or alternate LeetCode profile URL explicitly provided by recruiter in chat.",
                     },
                     "github_url": {
                         "type": "string",
-                        "description": "GitHub profile URL supplied by the recruiter, e.g. https://github.com/<handle>. Saved to the candidate and used for verification.",
+                        "description": "Optional: New or alternate GitHub profile URL explicitly provided by recruiter in chat.",
                     },
                     "profile_url": {
                         "type": "string",
-                        "description": "Personal website / portfolio URL supplied by the recruiter. Saved to the candidate; the tool fetches the page, returns its projects/text/links, and discovers any GitHub/LeetCode profiles it links to.",
+                        "description": "Optional: New or alternate personal website / portfolio URL explicitly provided by recruiter.",
                     },
                 },
                 "required": ["candidate_name_or_id"],
@@ -350,11 +350,16 @@ CRITICAL INSTRUCTIONS & RECRUITER POLICIES:
      - App connections (Composio):
        - If an external app (Gmail, Google Calendar, Google Meet, Microsoft Teams, GitHub) is not connected, call `COMPOSIO_MANAGE_CONNECTIONS` for that toolkit and share the returned Connect Link with the recruiter. Never say you cannot connect an account, and never ask the recruiter to paste credentials.
        - When you need an app action that is not covered by a recruiter tool above, use `COMPOSIO_SEARCH_TOOLS` to find the right tool and `COMPOSIO_MULTI_EXECUTE_TOOL` to run it. Never fabricate a result or a link.
-4. Technical Verification:
-   - Use `verify_candidate` to look up LeetCode ratings, problem counts, and GitHub repositories.
-   - If the recruiter provides a LeetCode or GitHub profile URL, pass it to `verify_candidate` as `leetcode_url` / `github_url`. Never report a profile as "not verified" when the recruiter just gave you a URL — call the tool with that URL first.
-   - If the recruiter provides a personal website or portfolio URL, or asks you to check/inspect the candidate's portfolio (even a URL in the message), pass it as `profile_url`. The tool fetches the live page and returns `website.text`, `website.headings`, `website.links` and any discovered GitHub/LeetCode/LinkedIn profiles. Summarise the projects, skills, and claims actually on that page, and verify the profiles it links to.
-   - You CAN read websites through this tool. NEVER say "I can't browse the live site" or ask the recruiter to paste the content — call `verify_candidate` with `profile_url` instead.
+4. Technical Verification (LeetCode, GitHub, Portfolio):
+   - When the recruiter asks to check, verify, or inspect a candidate's LeetCode, GitHub, portfolio, or coding activity (e.g. "check his leetcode and github", "how many questions solved on leetcode", "check his github repos", "verify his technical credentials"):
+     - IMMEDIATELY call `verify_candidate(candidate_name_or_id=...)` in your first turn!
+     - NEVER ask the recruiter for profile URLs or permission to search. The candidate's GitHub and LeetCode URLs are ALREADY stored in their profile in the database, and `verify_candidate` reads and checks them automatically.
+     - ONLY pass `leetcode_url`, `github_url`, or `profile_url` if the recruiter explicitly typed a URL in their message. If they did not supply a URL, simply call `verify_candidate(candidate_name_or_id="Candidate Name")`.
+     - After `verify_candidate` returns, summarize:
+       * LeetCode: Total solved questions, solved breakdown by difficulty (Easy, Medium, Hard), and global ranking.
+       * GitHub: Total public repositories, top programming languages, recent push activity, and notable projects.
+       * Portfolio/Website: Live projects and claims verified from their personal website.
+   - You CAN read websites through this tool. NEVER say "I can't browse the live site" or ask the recruiter to paste the content — call `verify_candidate` instead.
 5. Proactive, Executive Assistance:
    - Be professional, concise, proactive, and clear. Always outline next steps.
 """
@@ -536,6 +541,10 @@ async def execute_tool_call(
                     "experience_years": r.get("experience_years"),
                     "location": r.get("location"),
                     "pipeline_status": r.get("pipeline_status"),
+                    "github_url": r.get("github_url"),
+                    "leetcode_url": r.get("leetcode_url"),
+                    "portfolio_url": r.get("portfolio_url"),
+                    "linkedin_url": r.get("linkedin_url"),
                 }
                 for r in rows
             ],
@@ -876,6 +885,19 @@ async def execute_tool_call(
                 updates["leetcode_url"] = profile_arg
             elif kind == "website" and profile_arg != cand.get("portfolio_url"):
                 updates["portfolio_url"] = profile_arg
+
+        # Fallback: if github_url or leetcode_url is still empty, scan candidate's resume_text
+        if cand.get("resume_text") and (not cand.get("github_url") or not cand.get("leetcode_url")):
+            from ..services.resume import _extract_urls
+            for found_url in _extract_urls(cand["resume_text"]):
+                k = verification.profile_links.classify_url(found_url)
+                if k == "github" and not cand.get("github_url") and not updates.get("github_url"):
+                    updates["github_url"] = found_url
+                elif k == "leetcode" and not cand.get("leetcode_url") and not updates.get("leetcode_url"):
+                    updates["leetcode_url"] = found_url
+                elif k == "website" and not cand.get("portfolio_url") and not updates.get("portfolio_url"):
+                    updates["portfolio_url"] = found_url
+
         if updates:
             await session.execute(
                 sa.update(candidates)
@@ -924,7 +946,18 @@ async def execute_tool_call(
                 "profile_url": gh.get("profile_url") or gh.get("source_url"),
                 "username": gh.get("username"),
                 "public_repos": gh.get("public_repos"),
-                "relevant_repos": [r.get("name") for r in (gh.get("relevant_repositories") or [])[:5]],
+                "followers": gh.get("followers"),
+                "last_push_at": gh.get("last_push_at"),
+                "top_languages": gh.get("top_languages") or [],
+                "relevant_repos": [
+                    {
+                        "name": r.get("name"),
+                        "language": r.get("language"),
+                        "stars": r.get("stars", 0),
+                        "description": r.get("description"),
+                    }
+                    for r in (gh.get("relevant_repositories") or [])[:5]
+                ],
                 "discovered_from": gh.get("discovered_from"),
             },
             "leetcode": {
