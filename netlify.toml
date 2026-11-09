@@ -5,6 +5,8 @@
 
 [build.environment]
   NODE_VERSION = "22"
+  NEXT_PUBLIC_SUPABASE_URL = "https://sncotroyqgbputmwqiou.supabase.co"
+  NEXT_PUBLIC_SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InNuY290cm95cWdicHV0bXdxaW91Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTM5NjIzMTYsImV4cCI6MjEwOTUzODMxNn0.BwZpZzSG7uyGaUMQI7RQm2yBCvDA1H_k1n4PNVsAsCg"
 
 [[redirects]]
   from = "/api/*"
@@ -17,3 +19,4 @@
   to = "http://15.206.160.2/health"
   status = 200
   force = true
+
