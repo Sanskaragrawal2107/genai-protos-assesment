@@ -1257,7 +1257,7 @@ async def get_thread(ctx: CtxDep, thread_id: str) -> dict[str, Any]:
             sa.select(db_module.chat_messages)
             .where(db_module.chat_messages.c.thread_id == thread_id)
             .order_by(db_module.chat_messages.c.created_at.asc())
-            .limit(100)
+            .limit(300)
         )
     ).mappings().all()
     return {"thread": dict(thread), "messages": [dict(m) for m in messages]}

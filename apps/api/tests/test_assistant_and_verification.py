@@ -112,3 +112,45 @@ def test_reply_chunking_stream():
     assert len(chunks) == 3
     assert "".join(chunks) == text
 
+
+def test_system_prompt_calendar_and_safety_rules():
+    from app.graphs.assistant_graph import SYSTEM_PROMPT, AGENT_TOOLS
+
+    # 1. list_interviews tool description explicitly mentions schedule inquiries
+    tool_names = [t["function"]["name"] for t in AGENT_TOOLS]
+    assert "list_interviews" in tool_names
+    list_tool = next(t for t in AGENT_TOOLS if t["function"]["name"] == "list_interviews")
+    assert "scheduled upcoming interviews" in list_tool["function"]["description"]
+
+    # 2. Safety rules in SYSTEM_PROMPT
+    assert "ONLY call `approve_and_send_email`" in SYSTEM_PROMPT
+    assert "Checking Schedules, Calendar & Pipeline Queries" in SYSTEM_PROMPT
+    assert "list_interviews" in SYSTEM_PROMPT
+
+
+def test_conversation_history_user_turn_guarantee():
+    # Simulates the logic in run_assistant_stream for guaranteeing the user message is final
+    user_message = "How many interviews are scheduled for tomorrow?"
+    # Simulate prior_rows from DB where older turns existed
+    prior_rows = [
+        {"role": "user", "content": "draft email for sanskar"},
+        {"role": "assistant", "content": "Email drafted."},
+        {"role": "user", "content": "try sending mail again"},
+        {"role": "assistant", "content": "Email sent."},
+    ]
+    messages = [{"role": "system", "content": "system prompt"}]
+    for row in prior_rows:
+        r = row["role"]
+        c = row["content"]
+        if r in ("user", "assistant") and c:
+            messages.append({"role": r, "content": c})
+
+    # The hard guarantee from run_assistant_stream
+    if not messages or messages[-1].get("role") != "user" or messages[-1].get("content") != user_message:
+        messages.append({"role": "user", "content": user_message})
+
+    assert messages[-1]["role"] == "user"
+    assert messages[-1]["content"] == "How many interviews are scheduled for tomorrow?"
+    assert len(messages) == 6
+
+

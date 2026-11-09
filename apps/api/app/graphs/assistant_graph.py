@@ -234,11 +234,15 @@ AGENT_TOOLS = [
         "type": "function",
         "function": {
             "name": "list_interviews",
-            "description": "Check the calendar for upcoming interviews.",
+            "description": (
+                "Check the calendar and database for scheduled upcoming interviews. Call this whenever the recruiter "
+                "asks how many interviews are scheduled, asks about upcoming interviews (e.g. 'interviews scheduled for tomorrow', "
+                "'what is on my calendar'), or asks to see their schedule."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "time_expression": {"type": "string", "description": "Filter window e.g. 'tomorrow' or null for all"},
+                    "time_expression": {"type": "string", "description": "Filter window e.g. 'tomorrow', 'today', 'this week', or null for all"},
                 },
             },
         },
@@ -324,6 +328,7 @@ CRITICAL INSTRUCTIONS & RECRUITER POLICIES:
        - You may draft an email asking for the candidate's availability OR
        - Ask the recruiter: "What date and time would you like to schedule the interview for (e.g., tomorrow at 3:00 PM)? Once you provide the time, I can create the Microsoft Teams/Google Meet invite, generate the join link, and embed it into the email."
    - When the user confirms to send the email (e.g. "send it", "no send it for now", "send it for now", "send the mail", "yes send it", "go ahead and send it", "approve and send", "send now", "send it again"):
+     - CRITICAL SAFETY RULE: ONLY call `approve_and_send_email` when the recruiter's CURRENT message explicitly instructs sending, dispatching, or approving an email! NEVER call `approve_and_send_email` when the recruiter asks a question about the schedule, interviews, candidate technical credentials, or anything else.
      - IMMEDIATELY call `approve_and_send_email`.
      - If the recruiter supplied a company name, interviewer name, or asked to omit contact details, pass `company_name`, `interviewer_name`, and `omit_contact_info=true` accordingly. Never invent these values. When they did not, the saved company profile is used automatically — do not ask for it.
      - In your final response:
@@ -360,8 +365,16 @@ CRITICAL INSTRUCTIONS & RECRUITER POLICIES:
        * GitHub: Total public repositories, top programming languages, recent push activity, and notable projects.
        * Portfolio/Website: Live projects and claims verified from their personal website.
    - You CAN read websites through this tool. NEVER say "I can't browse the live site" or ask the recruiter to paste the content — call `verify_candidate` instead.
-5. Proactive, Executive Assistance:
-   - Be professional, concise, proactive, and clear. Always outline next steps.
+5. Checking Schedules, Calendar & Pipeline Queries:
+   - When the recruiter asks about scheduled interviews, existing meetings, or their calendar (e.g. "how many interviews are scheduled for tomorrow?", "what interviews do I have?", "check my schedule", "any meetings on Tuesday?"):
+     - IMMEDIATELY call `list_interviews(time_expression=...)`!
+     - NEVER schedule a new interview, draft an email, or send an email when asked about existing schedules!
+     - From the returned interviews, check the start times, candidate names, and platforms, and answer their question directly:
+       * If interviews are found for that window/date: State the exact count and list them with candidate name, start time (in IST), provider, and join link.
+       * If no interviews are scheduled for that date/window: State clearly that no interviews are scheduled for that day, and summarize other upcoming interviews if present.
+   - When asked about overall recruitment metrics or waiting candidates, call `get_pipeline_summary`.
+6. Proactive, Executive Assistance:
+   - Be professional, concise, proactive, and clear. Answer the specific question asked.
 """
 
 
@@ -1422,18 +1435,19 @@ async def run_assistant_stream(
     )
     await session.commit()
 
-    # 3. Load previous conversation history for this thread
-    prior_rows = (
+    # 3. Load previous conversation history for this thread (most recent 30 messages in chronological order)
+    recent_rows = (
         await session.execute(
             sa.select(chat_messages)
             .where(
                 chat_messages.c.thread_id == thread_id,
                 chat_messages.c.workspace_id == workspace_id,
             )
-            .order_by(chat_messages.c.created_at.asc())
-            .limit(16)
+            .order_by(chat_messages.c.created_at.desc())
+            .limit(30)
         )
     ).mappings().all()
+    prior_rows = list(reversed(recent_rows))
 
     messages: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
     for row in prior_rows:
@@ -1441,6 +1455,10 @@ async def run_assistant_stream(
         c = row["content"]
         if r in ("user", "assistant") and c:
             messages.append({"role": r, "content": c})
+
+    # Hard guarantee: Ensure the user's latest message is always the active final turn
+    if not messages or messages[-1].get("role") != "user" or messages[-1].get("content") != user_message:
+        messages.append({"role": "user", "content": user_message})
 
     accumulated_candidates: list[dict[str, Any]] = []
     accumulated_pending: list[dict[str, Any]] = []
