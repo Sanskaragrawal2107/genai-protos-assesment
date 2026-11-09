@@ -61,6 +61,7 @@ from ..schemas import (
 from ..services import communications as comms
 from ..services import composio_mcp
 from ..services import ingestion as ing
+from ..services.calendar import clear_provider_failure
 from ..services.interviews import (
     availability,
     cancel_interview,
@@ -334,6 +335,11 @@ async def connect(ctx: CtxDep, body: ConnectRequest) -> dict[str, Any]:
         "last_error": None,
         "updated_at": now,
     }
+    # A fresh OAuth link must clear any cached provider failure, otherwise a
+    # reconnect would stay "broken" until the short failure TTL expires.
+    if existing:
+        clear_provider_failure(existing.get("composio_connected_account_id"))
+    clear_provider_failure(link.get("connected_account_id"))
     if existing:
         account_id = existing["id"]
         await ctx.session.execute(
@@ -419,6 +425,10 @@ async def verify_connector(ctx: CtxDep, account_id: str) -> dict[str, Any]:
         )
     )
     await ctx.session.commit()
+    if new_status == "active":
+        # Account is healthy again: drop the cached failure so the next meeting
+        # attempt actually reaches the provider.
+        clear_provider_failure(row.get("composio_connected_account_id"))
     if new_status == "active" and row["provider"] == "gmail":
         await ing.ensure_sync_settings(
             ctx.session, workspace_id=ctx.workspace_id, account_id=account_id

@@ -30,6 +30,7 @@ from ..db import (
     pending_actions,
     utcnow,
 )
+from ..llm import is_reasoning_model
 from ..repo import (
     candidate_summary,
     create_pending_action,
@@ -558,6 +559,31 @@ async def execute_tool_call(
         raw_subject = args.get("subject", "Update regarding your application")
         raw_body = args.get("body", "")
         email_type = args.get("email_type", "shortlist")
+
+        # schedule_interview already drafts and queues the interview invitation.
+        # If the model asks for a second invitation in the same turn, point it at
+        # the existing draft instead of paying for another generation and
+        # creating a duplicate pending action.
+        if email_type == "interview_invite":
+            for action in accumulated_pending:
+                payload = action.get("payload") or {}
+                if (
+                    action.get("kind") == "send_email"
+                    and payload.get("candidate_id") == cand["id"]
+                    and payload.get("interview_id")
+                ):
+                    return {
+                        "status": "already_drafted",
+                        "candidate_name": cand["full_name"],
+                        "candidate_email": cand.get("email"),
+                        "pending_action_id": action.get("id"),
+                        "subject": payload.get("subject"),
+                        "message": (
+                            f"The interview invitation for {cand['full_name']} is already drafted "
+                            "and queued for approval in this turn. Do not draft a second email — "
+                            "tell the recruiter it is waiting in Pending actions."
+                        ),
+                    }
 
         subject, body, int_info = await _hydrate_email_content(
             session, workspace_id, cand, recruiter_id, raw_subject, raw_body
@@ -1155,14 +1181,25 @@ def _domain_tools(
     return tools
 
 
+def _chat_model() -> ChatOpenAI:
+    kwargs: dict[str, Any] = {
+        "model": settings.llm_model,
+        "api_key": settings.openai_api_key,
+        "base_url": settings.openai_base_url,
+        "temperature": settings.llm_temperature,
+    }
+    if is_reasoning_model(settings.llm_model):
+        # Reasoning budget is the dominant latency knob: on gpt-5-nano the
+        # provider default spent 30s+ per planning call, while "low" produced the
+        # same tool choices in ~7s (and "minimal" in ~2s).
+        effort = (settings.llm_reasoning_effort or "").strip().lower()
+        if effort:
+            kwargs["reasoning_effort"] = effort
+    return ChatOpenAI(**kwargs)
+
+
 def _build_agent(tools: list[Any], *, system_prompt: str = SYSTEM_PROMPT) -> Any:
-    model = ChatOpenAI(
-        model=settings.llm_model,
-        api_key=settings.openai_api_key,
-        base_url=settings.openai_base_url,
-        temperature=settings.llm_temperature,
-    )
-    return create_agent(model=model, tools=tools, system_prompt=system_prompt)
+    return create_agent(model=_chat_model(), tools=tools, system_prompt=system_prompt)
 
 
 # ---------------------------------------------------------------- job context
@@ -1344,8 +1381,49 @@ async def run_assistant_stream(
 
         started_at: dict[str, float] = {}
         streamed = False
+        turn_started = time.perf_counter()
 
-        async for event in agent.astream_events({"messages": lc_messages}, version="v2"):
+        # Pump the agent's event stream through a queue so the client keeps
+        # getting progress ticks during long model calls. Reasoning models emit
+        # no content tokens while they think, so without this the UI looks
+        # frozen for 10-30s per planning step.
+        async def _events_with_heartbeat() -> AsyncIterator[dict[str, Any]]:
+            queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
+
+            async def _pump() -> None:
+                try:
+                    async for item in agent.astream_events({"messages": lc_messages}, version="v2"):
+                        await queue.put(("event", item))
+                except Exception as exc:  # noqa: BLE001 - re-raised in the consumer
+                    await queue.put(("error", exc))
+                finally:
+                    await queue.put(("end", None))
+
+            task = asyncio.create_task(_pump())
+            try:
+                while True:
+                    try:
+                        item_kind, queued = await asyncio.wait_for(queue.get(), timeout=3)
+                    except asyncio.TimeoutError:
+                        yield {"__heartbeat__": True}
+                        continue
+                    if item_kind == "end":
+                        return
+                    if item_kind == "error":
+                        raise queued
+                    yield queued
+            finally:
+                if not task.done():
+                    task.cancel()
+
+        async for event in _events_with_heartbeat():
+            if event.get("__heartbeat__"):
+                yield {
+                    "type": "progress",
+                    "elapsed_ms": int((time.perf_counter() - turn_started) * 1000),
+                }
+                continue
+
             kind = event.get("event")
             run_id = str(event.get("run_id") or "")
             name = event.get("name") or ""

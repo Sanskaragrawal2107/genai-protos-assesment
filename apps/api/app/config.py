@@ -97,6 +97,10 @@ class Settings(BaseSettings):
     openai_base_url: str = "https://api.openai.com/v1"
     llm_model: str = "gpt-4o-mini"
     llm_temperature: float = 0.1
+    # Reasoning budget for gpt-5*/o-series models (ignored by other models).
+    # The provider default spent 30s+ per agent call on gpt-5-nano; "low" keeps
+    # the same tool choices at a fraction of the latency. Empty = provider default.
+    llm_reasoning_effort: str = "low"
 
     # composio — the only external tool layer (Gmail + Microsoft Teams).
     # Auth configs are resolved (or created) per toolkit at connect time, so no

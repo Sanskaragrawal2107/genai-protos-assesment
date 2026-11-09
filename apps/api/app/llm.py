@@ -64,6 +64,19 @@ def wrap_document(text: str | None, *, source: str) -> str:
     return f'<untrusted_document source="{source}">\n{body}\n</untrusted_document>'
 
 
+_REASONING_MODEL_PREFIXES = ("gpt-5", "o1", "o3", "o4")
+
+
+def is_reasoning_model(model: str | None) -> bool:
+    """True for models that take ``reasoning_effort`` and ``max_completion_tokens``.
+
+    gpt-5*/o-series reject ``temperature`` and spend completion tokens on
+    internal reasoning, so callers must budget for that (and usually lower the
+    effort: the provider default cost 30s+ per agent call on gpt-5-nano).
+    """
+    return (model or "").strip().lower().startswith(_REASONING_MODEL_PREFIXES)
+
+
 def _extract_json(raw: str) -> dict[str, Any]:
     raw = raw.strip()
     if raw.startswith("```"):
@@ -113,10 +126,14 @@ class LLMClient:
 
         # Next-gen and reasoning models (gpt-5*, o1*, o3*) require max_completion_tokens
         # and do not accept custom temperature values. They also consume token budget on
-        # internal reasoning tokens, so allocate sufficient completion headroom (16k+).
-        is_reasoning_or_gpt5 = any(self.model.lower().startswith(p) for p in ("gpt-5", "o1", "o3"))
-        if is_reasoning_or_gpt5:
-            payload["max_completion_tokens"] = max(max_tokens + 12000, 16384)
+        # internal reasoning tokens, so allocate completion headroom — but keep it
+        # bounded: a 16k allowance let a four-line email burn ~1.2k reasoning tokens
+        # and ~10s of wall clock per draft.
+        if is_reasoning_model(self.model):
+            payload["max_completion_tokens"] = min(max(max_tokens + 800, 1200), 4096)
+            effort = (settings.llm_reasoning_effort or "").strip().lower()
+            if effort:
+                payload["reasoning_effort"] = effort
         else:
             temp = settings.llm_temperature if temperature is None else temperature
             if temp is not None:

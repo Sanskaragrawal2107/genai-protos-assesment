@@ -70,6 +70,7 @@ interface Turn {
   error?: string;
   steps?: Step[];
   streaming?: boolean;
+  progressMs?: number;
 }
 
 interface ThreadSummary {
@@ -403,6 +404,11 @@ function AssistantInner() {
           if (event === "token") {
             const chunk = (data as { text?: string }).text ?? "";
             if (chunk) patch((turn) => ({ ...turn, text: turn.text + chunk }));
+            return;
+          }
+          if (event === "progress") {
+            const elapsed = (data as { elapsed_ms?: number }).elapsed_ms;
+            patch((turn) => ({ ...turn, progressMs: typeof elapsed === "number" ? elapsed : turn.progressMs }));
             return;
           }
           if (event === "connect") {
@@ -761,9 +767,16 @@ function AssistantInner() {
 
                     {turn.text ? (
                       <MarkdownMessage content={turn.text} streaming={turn.streaming} />
-                    ) : turn.streaming && (!turn.steps || turn.steps.length === 0) ? (
+                    ) : null}
+
+                    {turn.streaming && !turn.text ? (
                       <div className="flex items-center gap-2 py-1 text-[12px] text-[#8a8a93]">
-                        <Loader2 size={13} className="animate-spin" /> Working…
+                        <Loader2 size={13} className="animate-spin" />
+                        <span>
+                          {turn.progressMs
+                            ? `Working… ${Math.round(turn.progressMs / 1000)}s`
+                            : "Working…"}
+                        </span>
                       </div>
                     ) : null}
 

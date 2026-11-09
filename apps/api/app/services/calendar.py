@@ -19,15 +19,61 @@ The join URL is never synthesised: if the provider does not return one, an
 """
 from __future__ import annotations
 
+import logging
+import time
 from dataclasses import dataclass
-from datetime import datetime, time, timedelta, timezone
+from datetime import datetime, time as dt_time, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from ..composio import IntegrationError, composio, normalize_tool_data
 from ..config import settings
 
+log = logging.getLogger(__name__)
+
 MEETING_PROVIDERS = ("microsoft_teams", "google_meet", "none")
+
+# A broken provider connection is remembered briefly so every chat turn does not
+# pay for the same failing network call (a Teams auth failure costs ~10s).
+_PROVIDER_FAILURE_TTL_SECONDS = 300
+_provider_failures: dict[str, tuple[float, str]] = {}
+
+
+def provider_failure(account_id: str | None) -> str | None:
+    """Return a fresh cached auth failure for a connected account, if any."""
+    key = str(account_id or "")
+    if not key:
+        return None
+    entry = _provider_failures.get(key)
+    if not entry:
+        return None
+    expires_at, message = entry
+    if time.monotonic() >= expires_at:
+        _provider_failures.pop(key, None)
+        return None
+    return message
+
+
+def remember_provider_failure(account_id: str | None, message: str) -> None:
+    """Cache an auth failure so the next call fails fast instead of re-hanging."""
+    key = str(account_id or "")
+    if not key:
+        return
+    _provider_failures[key] = (
+        time.monotonic() + _PROVIDER_FAILURE_TTL_SECONDS,
+        message,
+    )
+
+
+def clear_provider_failure(account_id: str | None) -> None:
+    key = str(account_id or "")
+    if key:
+        _provider_failures.pop(key, None)
+
+
+def _is_auth_failure(exc: IntegrationError) -> bool:
+    text = str(exc).lower()
+    return "authenticat" in text or "unauthorized" in text or "invalid_grant" in text
 
 
 @dataclass(slots=True)
@@ -202,12 +248,27 @@ class TeamsMeetingProvider:
                 provider="microsoft_teams",
                 code="not_connected",
             )
-        return await composio.execute(
-            slug,
-            user_id=self.user_id,
-            arguments=arguments,
-            connected_account_id=self.connected_account_id,
-        )
+        cached = provider_failure(self.connected_account_id)
+        if cached:
+            raise IntegrationError(
+                "Microsoft Teams authentication is still failing; the connection must be "
+                f"renewed in Settings → Integrations before it can be used again. Last error: {cached[:160]}",
+                provider="microsoft_teams",
+                code="auth_cached",
+            )
+        try:
+            result = await composio.execute(
+                slug,
+                user_id=self.user_id,
+                arguments=arguments,
+                connected_account_id=self.connected_account_id,
+            )
+        except IntegrationError as exc:
+            if _is_auth_failure(exc):
+                remember_provider_failure(self.connected_account_id, str(exc))
+            raise
+        clear_provider_failure(self.connected_account_id)
+        return result
 
     async def create_meeting(
         self,
@@ -371,12 +432,28 @@ class GoogleMeetProvider:
                 provider="google_meet",
                 code="not_connected",
             )
-        return await composio.execute(
-            slug,
-            user_id=account.get("composio_user_id") or "",
-            arguments=arguments,
-            connected_account_id=account.get("composio_connected_account_id"),
-        )
+        account_id = account.get("composio_connected_account_id")
+        cached = provider_failure(account_id)
+        if cached:
+            raise IntegrationError(
+                "Google authentication is still failing; the connection must be renewed in "
+                f"Settings → Integrations before it can be used again. Last error: {cached[:160]}",
+                provider="google_meet",
+                code="auth_cached",
+            )
+        try:
+            result = await composio.execute(
+                slug,
+                user_id=account.get("composio_user_id") or "",
+                arguments=arguments,
+                connected_account_id=account_id,
+            )
+        except IntegrationError as exc:
+            if _is_auth_failure(exc):
+                remember_provider_failure(account_id, str(exc))
+            raise
+        clear_provider_failure(account_id)
+        return result
 
     async def create_meeting(
         self,
@@ -556,8 +633,8 @@ def _ensure_aware(value: Any) -> datetime:
 def working_window(day: datetime, *, timezone_name: str) -> TimeSlot:
     tz = ZoneInfo(timezone_name)
     local = day.astimezone(tz)
-    start = datetime.combine(local.date(), time(settings.working_hours_start, 0), tzinfo=tz)
-    end = datetime.combine(local.date(), time(settings.working_hours_end, 0), tzinfo=tz)
+    start = datetime.combine(local.date(), dt_time(settings.working_hours_start, 0), tzinfo=tz)
+    end = datetime.combine(local.date(), dt_time(settings.working_hours_end, 0), tzinfo=tz)
     return TimeSlot(start.astimezone(timezone.utc), end.astimezone(timezone.utc))
 
 
