@@ -126,22 +126,6 @@ export default function IntegrationsSettings() {
     }
   }
 
-  async function setProvider(provider: string) {
-    setBusy("provider");
-    setError(null);
-    try {
-      await api("/api/workspace/meeting-provider", { method: "PUT", body: { provider } });
-      setNotice("Meeting provider updated.");
-      await reloadMe();
-    } catch (err) {
-      setError(err instanceof ApiError ? err.message : String(err));
-    } finally {
-      setBusy(null);
-    }
-  }
-
-  const meetingProvider = me?.workspace.meeting_provider || "microsoft_teams";
-
   return (
     <div className="space-y-5">
       <PageHeader
@@ -267,24 +251,11 @@ export default function IntegrationsSettings() {
           <div>
             <h2 className="text-[13px] font-medium text-[#18181b]">Meeting provider</h2>
             <p className="mt-0.5 text-[11.5px] text-[#8a8a93]">
-              Each interview uses the provider selected here unless the scheduling request overrides it.
-              The real link is created before the invitation is sent.
+              There is no workspace default. You choose Google Meet or Microsoft Teams for each
+              interview in chat, and the real link is created before the invitation is sent.
             </p>
           </div>
-          <select
-            className="input max-w-[220px]"
-            value={meetingProvider}
-            onChange={(event) => void setProvider(event.target.value)}
-            disabled={busy !== null}
-          >
-            <option value="microsoft_teams">Microsoft Teams</option>
-            <option value="google_meet">Google Meet</option>
-            <option value="none">No meeting provider</option>
-          </select>
         </div>
-        <p className="mt-3 border-t border-[#f4f4f1] pt-3 text-[11px] text-[#8a8a93]">
-          Current: {providerLabel(meetingProvider)}.
-        </p>
       </Card>
 
       <div className="flex flex-wrap items-center gap-2 text-[10.5px] text-[#a1a1aa]">

@@ -45,7 +45,6 @@ from app.repo import (  # noqa: E402
     list_candidates,
     list_pending_actions,
     log_activity,
-    meeting_provider_for,
     set_candidate_status,
     to_jsonable,
 )
@@ -503,22 +502,21 @@ async def schedule_interview(
 ) -> dict[str, Any]:
     """Create the real meeting (Teams or Google Meet) and email the Gmail invitation.
 
-    The provider defaults to the workspace setting and can be overridden per
-    interview. Without confirm=true this only creates a pending action for the
-    recruiter."""
+    There is no workspace default: pass ``provider`` explicitly. When it is
+    omitted the call returns ``needs_platform`` and asks the caller to choose.
+    Without confirm=true this only creates a pending action for the recruiter."""
     await _ensure_db()
     async with session() as db:
         ws = await _workspace(db)
         candidate = await get_candidate(db, ws, candidate_id)
         if not candidate:
             raise ValueError("Candidate not found")
-        resolved_provider = provider or await meeting_provider_for(db, ws)
         request = ScheduleRequest(
             candidate_id=candidate_id,
             start=_parse_iso(start_iso),
             duration_minutes=duration_minutes,
             timezone=timezone_name,
-            provider=resolved_provider,
+            provider=provider,
             title=f"Interview: {candidate['full_name']}",
             approve=confirm,
         )

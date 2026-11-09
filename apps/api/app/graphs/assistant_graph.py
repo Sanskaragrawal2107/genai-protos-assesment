@@ -26,7 +26,6 @@ from ..db import (
     candidates,
     chat_messages,
     chat_threads,
-    connected_accounts,
     jobs,
     pending_actions,
     utcnow,
@@ -34,6 +33,7 @@ from ..db import (
 from ..llm import is_reasoning_model
 from ..repo import (
     candidate_summary,
+    connected_meeting_providers,
     create_pending_action,
     list_candidates,
     normalize_meeting_provider,
@@ -330,7 +330,7 @@ CRITICAL INSTRUCTIONS & RECRUITER POLICIES:
      - If date and time is NOT provided: ASK the recruiter for their preferred date and time (e.g. "What date and time would you like to schedule the interview for?").
      - If date and time IS provided (e.g. "make a meeting link on the 12th of November at 4 pm"):
        - IMMEDIATELY call `schedule_interview` with candidate_name_or_id, time_expression, and the EXACT `meeting_provider` the recruiter asked for (google_meet for "Google Meet"/"Meet", microsoft_teams for "Teams"). Never substitute a different platform and never fall back to a workspace default.
-       - The platform is whatever the recruiter said in this conversation. If they never named one, call the tool without `meeting_provider` and use the platform it actually returns; do not assume Teams.
+       - The platform is whatever the recruiter said in this conversation. If they never named one, call the tool without `meeting_provider`: it returns `needs_platform`, and you must then ask the recruiter to choose Google Meet or Microsoft Teams (mention which are connected) before scheduling. Never assume Teams.
        - In your final response:
          1. State clearly that the interview is confirmed and scheduled.
          2. Provide the exact date, time, and timezone (e.g. Thursday, 12 November 2026 at 4:00 PM IST).
@@ -467,33 +467,6 @@ def provider_hint_from_message(message: str | None) -> str | None:
     if _MEET_SWITCH_RE.search(text):
         return "google_meet"
     if _TEAMS_SWITCH_RE.search(text):
-        return "microsoft_teams"
-    return None
-
-
-async def _connected_meeting_provider(session: AsyncSession, workspace_id: str) -> str | None:
-    """Platform to use when the recruiter did not name one.
-
-    Deliberately ignores any workspace-level default: a stored default is what
-    made a "use Google Meet" turn try Teams first (10s+ wasted). Google wins
-    when both are connected because a Meet link is usable by any invitee.
-    """
-    rows = (
-        await session.execute(
-            sa.select(connected_accounts.c.provider).where(
-                connected_accounts.c.workspace_id == workspace_id,
-                connected_accounts.c.status == "active",
-            )
-        )
-    ).scalars().all()
-    return pick_connected_meeting_provider({str(provider) for provider in rows})
-
-
-def pick_connected_meeting_provider(connected: set[str] | frozenset[str]) -> str | None:
-    """Map connected toolkit names onto a meeting provider (pure, testable)."""
-    if connected & {"google_meet", "google_calendar"}:
-        return "google_meet"
-    if "microsoft_teams" in connected:
         return "microsoft_teams"
     return None
 
@@ -675,20 +648,31 @@ async def execute_tool_call(
             return {"error": f"Could not parse '{time_str}'. Ask the recruiter for a specific date and time."}
 
         duration = int(args.get("duration_minutes") or 30)
-        # The recruiter's own words decide the platform. There is deliberately no
-        # workspace-wide default here: a stored default is what made a
-        # "use Google Meet" turn try Teams first and burn 10s on a broken account.
+        # There is no workspace-level default provider by design: the platform is
+        # whatever the recruiter said. If they did not say, ask them instead of
+        # guessing (a wrong guess used to try Teams first and burn 10s).
         raw_provider = (args.get("meeting_provider") or "").strip()
         if raw_provider:
             provider = normalize_meeting_provider(raw_provider)
         else:
-            provider = await _connected_meeting_provider(session, workspace_id)
-        if not provider:
+            platforms = await connected_meeting_providers(session, workspace_id)
+            ordered = [p for p in ("google_meet", "microsoft_teams") if p in platforms]
             return {
-                "error": (
-                    "No video meeting app is connected for this workspace. Ask the recruiter "
-                    "which platform to use (Google Meet or Microsoft Teams) and connect it first."
-                )
+                "status": "needs_platform",
+                "question": (
+                    "Which video platform should I use for this interview — Google Meet or "
+                    "Microsoft Teams?"
+                ),
+                "connected_platforms": ordered,
+                "not_connected": [
+                    p for p in ("google_meet", "microsoft_teams") if p not in platforms
+                ],
+                "message": (
+                    "The recruiter did not say which video platform to use. Ask them to choose "
+                    "Google Meet or Microsoft Teams (mention which are connected), then call "
+                    "schedule_interview again with meeting_provider set to their answer. Do not "
+                    "schedule anything yet."
+                ),
             }
 
         payload = {

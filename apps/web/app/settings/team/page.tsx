@@ -40,14 +40,10 @@ export default function TeamSettingsPage() {
         </Card>
         <Card className="p-4">
           <p className="stat-label">Meeting provider</p>
-          <p className="mt-1 text-[13px] font-medium text-[#18181b]">
-            {me?.workspace.meeting_provider === "microsoft_teams"
-              ? "Microsoft Teams"
-              : me?.workspace.meeting_provider === "google_meet"
-                ? "Google Meet"
-                : "Not configured"}
+          <p className="mt-1 text-[13px] font-medium text-[#18181b]">Chosen per interview</p>
+          <p className="mt-1 text-[11px] text-[#a1a1aa]">
+            Pick Google Meet or Microsoft Teams in chat · Email channel: Gmail only
           </p>
-          <p className="mt-1 text-[11px] text-[#a1a1aa]">Email channel: Gmail only</p>
         </Card>
       </div>
 

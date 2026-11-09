@@ -212,7 +212,7 @@ export interface SyncSnapshot {
 
 export interface Me {
   identity: { user_id: string; email?: string | null; name?: string | null; mode: string };
-  workspace: { id: string; name: string; meeting_provider: string };
+  workspace: { id: string; name: string };
   capabilities: {
     llm: boolean;
     composio: boolean;

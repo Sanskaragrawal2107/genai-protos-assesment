@@ -23,7 +23,6 @@ interface Props {
   open: boolean;
   onClose: () => void;
   candidate: Candidate;
-  defaultProvider?: string;
   timezone?: string;
   onScheduled?: () => void;
 }
@@ -32,7 +31,6 @@ export function ScheduleInterviewModal({
   open,
   onClose,
   candidate,
-  defaultProvider = "microsoft_teams",
   timezone,
   onScheduled,
 }: Props) {
@@ -40,9 +38,8 @@ export function ScheduleInterviewModal({
   const [start, setStart] = useState(defaultSlotValue(24));
   const [duration, setDuration] = useState(45);
   const [selectedZone, setSelectedZone] = useState(zone);
-  const [provider, setProvider] = useState(
-    defaultProvider === "none" || defaultProvider === "google_meet" ? defaultProvider : "microsoft_teams",
-  );
+  // No workspace default: the recruiter picks the platform each time.
+  const [provider, setProvider] = useState("");
   const [notes, setNotes] = useState("");
   const [autoApprove, setAutoApprove] = useState(false);
   const [busy, setBusy] = useState<"check" | "schedule" | null>(null);
@@ -105,6 +102,10 @@ export function ScheduleInterviewModal({
   }
 
   async function schedule() {
+    if (!provider) {
+      setError("Choose a meeting platform (Microsoft Teams or Google Meet) before scheduling.");
+      return;
+    }
     setBusy("schedule");
     setError(null);
     try {
@@ -209,6 +210,9 @@ export function ScheduleInterviewModal({
           <div>
             <label className="label">Meeting provider</label>
             <select className="input" value={provider} onChange={(event) => setProvider(event.target.value)}>
+              <option value="" disabled>
+                Select a platform
+              </option>
               <option value="microsoft_teams">Microsoft Teams</option>
               <option value="google_meet">Google Meet</option>
               <option value="none">No video link</option>

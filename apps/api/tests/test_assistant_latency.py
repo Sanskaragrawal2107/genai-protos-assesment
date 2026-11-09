@@ -121,15 +121,30 @@ def test_split_stream_chunk_ignores_tool_call_blocks():
     assert assistant_graph.split_stream_chunk(chunk) == ("", "")
 
 
-def test_connected_provider_picks_google_then_teams():
-    pick = assistant_graph.pick_connected_meeting_provider
+async def test_schedule_without_platform_asks_instead_of_guessing(monkeypatch):
+    async def _fake_resolve(session, workspace_id, name_or_id):
+        return {"id": "cand-1", "full_name": "Ada Lovelace", "email": "ada@example.com"}
 
-    assert pick({"gmail", "google_calendar"}) == "google_meet"
-    assert pick({"google_meet"}) == "google_meet"
-    # Google wins when both are connected (a Meet link works for any invitee).
-    assert pick({"microsoft_teams", "google_calendar"}) == "google_meet"
-    assert pick({"microsoft_teams"}) == "microsoft_teams"
-    assert pick({"gmail"}) is None
+    async def _fake_connected(session, workspace_id):
+        return {"google_meet", "microsoft_teams"}
+
+    monkeypatch.setattr(assistant_graph, "_resolve_candidate", _fake_resolve)
+    monkeypatch.setattr(assistant_graph, "connected_meeting_providers", _fake_connected)
+
+    result = await execute_tool_call(
+        name="schedule_interview",
+        args={"time_expression": "12th of November at 4 pm"},
+        session=None,  # type: ignore[arg-type]
+        workspace_id="ws-1",
+        recruiter_id=None,
+        accumulated_candidates=[],
+        accumulated_pending=[],
+    )
+
+    # No workspace default exists: the assistant must ask, never guess.
+    assert result["status"] == "needs_platform"
+    assert "Google Meet" in result["question"]
+    assert result["connected_platforms"] == ["google_meet", "microsoft_teams"]
 
 
 def test_provider_hint_reads_the_recruiters_words():

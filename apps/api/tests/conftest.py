@@ -79,7 +79,7 @@ async def workspace(db):
     now = utcnow()
     await db.execute(
         sa.insert(db_module.workspaces).values(
-            id=ws_id, name="Test workspace", settings={"meeting_provider": "microsoft_teams"}, created_at=now, updated_at=now
+            id=ws_id, name="Test workspace", settings={"require_approval": True}, created_at=now, updated_at=now
         )
     )
     await db.execute(

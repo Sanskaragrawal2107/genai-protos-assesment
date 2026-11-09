@@ -78,7 +78,7 @@ async def ensure_workspace(session: AsyncSession, identity: Identity) -> str:
         sa.insert(workspaces).values(
             id=ws_id,
             name=name,
-            settings={"meeting_provider": "microsoft_teams", "require_approval": True},
+            settings={"require_approval": True},
             created_at=now,
             updated_at=now,
         )
@@ -124,25 +124,28 @@ def normalize_meeting_provider(provider: str | None) -> str:
     return value if value in MEETING_PROVIDERS else "microsoft_teams"
 
 
-async def meeting_provider_for(session: AsyncSession, workspace_id: str) -> str:
-    ws = await get_workspace(session, workspace_id)
-    settings = (ws or {}).get("settings") or {}
-    return normalize_meeting_provider(settings.get("meeting_provider") or "microsoft_teams")
+async def connected_meeting_providers(session: AsyncSession, workspace_id: str) -> set[str]:
+    """Video platforms the workspace can actually use right now.
 
-
-async def set_meeting_provider(session: AsyncSession, workspace_id: str, provider: str) -> None:
-    provider = normalize_meeting_provider(provider)
-    ws = await get_workspace(session, workspace_id)
-    if not ws:
-        return
-    settings = dict(ws.get("settings") or {})
-    settings["meeting_provider"] = provider
-    await session.execute(
-        sa.update(workspaces)
-        .where(workspaces.c.id == workspace_id)
-        .values(settings=settings, updated_at=db.utcnow())
-    )
-    await session.commit()
+    There is no workspace-level default meeting provider: the recruiter chooses
+    the platform per meeting (in chat). This reads the connected accounts and
+    returns canonical provider ids (``google_meet`` / ``microsoft_teams``).
+    """
+    rows = (
+        await session.execute(
+            sa.select(connected_accounts.c.provider).where(
+                connected_accounts.c.workspace_id == workspace_id,
+                connected_accounts.c.status == "active",
+            )
+        )
+    ).scalars().all()
+    connected = {str(provider) for provider in rows}
+    platforms: set[str] = set()
+    if connected & {"google_meet", "google_calendar"}:
+        platforms.add("google_meet")
+    if "microsoft_teams" in connected:
+        platforms.add("microsoft_teams")
+    return platforms
 
 
 async def log_activity(

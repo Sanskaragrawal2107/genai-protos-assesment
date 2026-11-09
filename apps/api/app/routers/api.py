@@ -42,9 +42,7 @@ from ..repo import (
     list_candidates,
     list_pending_actions,
     log_activity,
-    meeting_provider_for,
     set_candidate_status,
-    set_meeting_provider,
 )
 from ..schemas import (
     CandidateFilters,
@@ -104,7 +102,6 @@ async def me(ctx: CtxDep) -> dict[str, Any]:
         "workspace": {
             "id": ctx.workspace_id,
             "name": ws["name"] if ws else "Workspace",
-            "meeting_provider": await meeting_provider_for(ctx.session, ctx.workspace_id),
         },
         "capabilities": {
             "llm": settings.llm_enabled,
@@ -489,20 +486,6 @@ async def disconnect(ctx: CtxDep, account_id: str) -> dict[str, Any]:
     )
     await ctx.session.commit()
     return {"status": "revoked", "id": account_id}
-
-
-@router.put("/workspace/meeting-provider")
-async def update_meeting_provider(ctx: CtxDep, body: dict[str, str]) -> dict[str, Any]:
-    raw = (body.get("provider") or "").strip().lower()
-    aliases = {"teams": "microsoft_teams", "google": "google_meet", "meet": "google_meet"}
-    provider = aliases.get(raw, raw)
-    if provider not in {"microsoft_teams", "google_meet", "none"}:
-        raise HTTPException(
-            status.HTTP_400_BAD_REQUEST,
-            "provider must be microsoft_teams | google_meet | none",
-        )
-    await set_meeting_provider(ctx.session, ctx.workspace_id, provider)
-    return {"meeting_provider": provider}
 
 
 # --------------------------------------------------------------------- sync

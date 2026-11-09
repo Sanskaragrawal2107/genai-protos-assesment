@@ -53,7 +53,6 @@ export async function fetchMeDirect(supabase: SupabaseClient): Promise<any> {
 
   let wsId: string = "default";
   let wsName = "Recruitment Workspace";
-  let meetingProvider = "microsoft_teams";
 
   const { data: member } = await supabase
     .from("workspace_members")
@@ -67,13 +66,11 @@ export async function fetchMeDirect(supabase: SupabaseClient): Promise<any> {
     wsId = member.workspace_id;
     const wsData: any = member.workspaces;
     if (wsData?.name) wsName = wsData.name;
-    if (wsData?.settings?.meeting_provider) meetingProvider = wsData.settings.meeting_provider;
   } else {
     const { data: ws } = await supabase.from("workspaces").select("id, name, settings").limit(1).maybeSingle();
     if (ws) {
       wsId = ws.id;
       wsName = ws.name || wsName;
-      if (ws.settings?.meeting_provider) meetingProvider = ws.settings.meeting_provider;
     }
   }
 
@@ -93,7 +90,6 @@ export async function fetchMeDirect(supabase: SupabaseClient): Promise<any> {
     workspace: {
       id: wsId,
       name: wsName,
-      meeting_provider: meetingProvider,
     },
     capabilities: {
       llm: true,

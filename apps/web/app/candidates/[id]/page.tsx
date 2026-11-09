@@ -777,7 +777,6 @@ export default function CandidateDetailPage() {
         open={scheduleOpen}
         onClose={() => setScheduleOpen(false)}
         candidate={{ id: data.id, full_name: data.full_name, email: data.email }}
-        defaultProvider={me?.workspace.meeting_provider}
         onScheduled={() => void reload()}
       />
       <DraftEmailModal

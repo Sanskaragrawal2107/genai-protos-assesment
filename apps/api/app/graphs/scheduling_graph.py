@@ -14,7 +14,7 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..composio import IntegrationError
-from ..repo import get_candidate, meeting_provider_for
+from ..repo import get_candidate
 from ..schemas import ScheduleRequest
 from ..services import interviews as svc
 
@@ -37,7 +37,6 @@ async def run_scheduling(
     if request.start is None:
         return {"status": "failed", "error": "A start time is required to schedule an interview"}
 
-    provider = request.provider or await meeting_provider_for(session, workspace_id)
     tz_name = request.timezone or "Asia/Kolkata"
 
     try:
@@ -62,7 +61,7 @@ async def run_scheduling(
             "calendar_connected": check.get("calendar_connected"),
         }
 
-    req_with_provider = request.model_copy(update={"provider": provider, "timezone": tz_name})
+    req_with_provider = request.model_copy(update={"timezone": tz_name})
     try:
         result = await svc.propose(
             session,

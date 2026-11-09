@@ -30,11 +30,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..composio import IntegrationError
 from ..db import candidates, interviews, pending_actions, utcnow, workspace_members
 from ..repo import (
+    connected_meeting_providers,
     create_pending_action,
     find_account,
     get_candidate,
     log_activity,
-    meeting_provider_for,
     normalize_meeting_provider,
     set_candidate_status,
 )
@@ -178,11 +178,20 @@ async def propose(
     if start is None:
         raise ValueError("A start time is required")
     duration = request.duration_minutes
-    provider = (
-        normalize_meeting_provider(request.provider)
-        if request.provider
-        else await meeting_provider_for(session, workspace_id)
-    )
+    # No workspace default: use the platform the caller supplied, otherwise the
+    # single connected one. If it is ambiguous, ask instead of guessing.
+    connected = await connected_meeting_providers(session, workspace_id)
+    if request.provider:
+        provider = normalize_meeting_provider(request.provider)
+    else:
+        provider = next(iter(connected)) if len(connected) == 1 else None
+    if not provider:
+        return {
+            "status": "needs_platform",
+            "reason": "Choose a video platform (Google Meet or Microsoft Teams) before scheduling.",
+            "connected_platforms": sorted(connected),
+            "timezone": timezone_name,
+        }
 
     check = await availability(
         session, workspace_id=workspace_id, start=start, duration_minutes=duration, timezone_name=timezone_name
