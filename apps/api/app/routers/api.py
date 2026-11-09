@@ -39,10 +39,13 @@ from ..repo import (
     create_pending_action,
     find_account,
     get_candidate,
+    get_workspace_profile,
     list_candidates,
     list_pending_actions,
     log_activity,
     set_candidate_status,
+    set_workspace_profile,
+    workspace_profile,
 )
 from ..schemas import (
     CandidateFilters,
@@ -55,6 +58,7 @@ from ..schemas import (
     SendEmailRequest,
     StatusUpdate,
     SyncSettingsIn,
+    WorkspaceProfileIn,
 )
 from ..services import communications as comms
 from ..services import composio_mcp
@@ -92,6 +96,7 @@ async def me(ctx: CtxDep) -> dict[str, Any]:
     ws = (
         await ctx.session.execute(sa.select(db_module.workspaces).where(db_module.workspaces.c.id == ctx.workspace_id))
     ).mappings().first()
+    profile = workspace_profile(dict(ws) if ws else None)
     return {
         "identity": {
             "user_id": ctx.identity.user_id,
@@ -102,6 +107,10 @@ async def me(ctx: CtxDep) -> dict[str, Any]:
         "workspace": {
             "id": ctx.workspace_id,
             "name": ws["name"] if ws else "Workspace",
+            **profile,
+            # The onboarding prompt only needs a company name; phone/interviewer
+            # can be completed later from Settings.
+            "profile_complete": bool(profile.get("company_name")),
         },
         "capabilities": {
             "llm": settings.llm_enabled,
@@ -110,6 +119,33 @@ async def me(ctx: CtxDep) -> dict[str, Any]:
             "supabase_auth": bool(settings.supabase_jwt_secret),
         },
         "connectors": [_connector(row) for row in connectors],
+    }
+
+
+@router.put("/workspace/profile")
+async def update_workspace_profile(ctx: CtxDep, body: WorkspaceProfileIn) -> dict[str, Any]:
+    """Save the company name, phone and interviewer used in every email."""
+    profile = await set_workspace_profile(
+        ctx.session,
+        ctx.workspace_id,
+        company_name=body.company_name,
+        company_phone=body.company_phone,
+        interviewer_name=body.interviewer_name,
+    )
+    await log_activity(
+        ctx.session,
+        workspace_id=ctx.workspace_id,
+        recruiter_id=ctx.user_id,
+        action="workspace.profile_updated",
+        entity_type="workspace",
+        entity_id=ctx.workspace_id,
+        metadata={"profile_complete": bool(profile.get("company_name"))},
+    )
+    await ctx.session.commit()
+    return {
+        "status": "saved",
+        "profile_complete": bool(profile.get("company_name")),
+        "profile": profile,
     }
 
 
@@ -1010,8 +1046,14 @@ async def draft_communication(ctx: CtxDep, body: SendEmailRequest) -> dict[str, 
     if body.subject and body.body:
         subject, content, method = body.subject, body.body, "manual"
     else:
+        profile = await get_workspace_profile(ctx.session, ctx.workspace_id)
         subject, content, method = await comms.draft_email(
-            kind=body.kind, candidate=candidate, instructions=body.body
+            kind=body.kind,
+            candidate=candidate,
+            instructions=body.body,
+            company_name=profile["company_name"] or None,
+            interviewer_name=profile["interviewer_name"] or None,
+            company_phone=profile["company_phone"] or None,
         )
     comm = await comms.queue_email(
         ctx.session,

@@ -35,6 +35,7 @@ from ..repo import (
     candidate_summary,
     connected_meeting_providers,
     create_pending_action,
+    get_workspace_profile,
     list_candidates,
     normalize_meeting_provider,
     set_candidate_status,
@@ -312,7 +313,10 @@ CRITICAL INSTRUCTIONS & RECRUITER POLICIES:
      - IMMEDIATELY call `draft_candidate_email` with a well-crafted, polished email body and subject line.
      - NEVER say "nobody is waiting on a follow-up" when the recruiter explicitly asked you to draft an email! Write the requested email.
      - CRITICAL PLACEHOLDER PREVENTION:
-       - NEVER EVER draft or output unpopulated bracket placeholders such as [DATE], [TIME], [TIMEZONE], [MEETING_PROVIDER], [JOIN_LINK], [LINK], [Company], [Your Name], [Interviewer Name]!
+       - The recruiter's saved company profile supplies the company name, company phone and interviewer/host name. Use them automatically and NEVER ask for them again.
+       - Sign every email with the saved company name and interviewer name. For the phone number write the literal placeholder [Phone]; the server replaces it with the saved company phone. [Company] and [Interviewer Name] are also filled by the server.
+       - Only use a different value when the recruiter explicitly supplies one in this conversation.
+       - NEVER EVER draft or output unpopulated bracket placeholders such as [DATE], [TIME], [TIMEZONE], [MEETING_PROVIDER], [JOIN_LINK], [LINK], [Your Name]!
        - If an interview has already been scheduled or discussed, use the EXACT date, time, timezone, platform, and actual live Microsoft Teams / Google Meet join URL returned by the scheduling tool — never invent one.
        - Note to the recruiter: Both the candidate (attendee) and the reviewer/interviewer (host) join using this exact same Microsoft Teams / Google Meet link.
      - In your response, clearly present the drafted email (Subject, Recipient, Body, and Interviewer/Candidate join links) and inform the user that it is queued for their approval.
@@ -321,7 +325,7 @@ CRITICAL INSTRUCTIONS & RECRUITER POLICIES:
        - Ask the recruiter: "What date and time would you like to schedule the interview for (e.g., tomorrow at 3:00 PM)? Once you provide the time, I can create the Microsoft Teams/Google Meet invite, generate the join link, and embed it into the email."
    - When the user confirms to send the email (e.g. "send it", "no send it for now", "send it for now", "send the mail", "yes send it", "go ahead and send it", "approve and send", "send now", "send it again"):
      - IMMEDIATELY call `approve_and_send_email`.
-     - If the recruiter supplied a company name, interviewer name, or asked to omit contact details, pass `company_name`, `interviewer_name`, and `omit_contact_info=true` accordingly. Never invent these values.
+     - If the recruiter supplied a company name, interviewer name, or asked to omit contact details, pass `company_name`, `interviewer_name`, and `omit_contact_info=true` accordingly. Never invent these values. When they did not, the saved company profile is used automatically — do not ask for it.
      - In your final response:
        - Clearly confirm that the invitation email has been sent to the candidate via your connected Gmail account. Mention the candidate's name, email address, company name, interviewer name, and meeting link.
        - NEVER say "I will not send the invitation yet", "it remains in draft status", or "waiting for your approval" after calling `approve_and_send_email`!
@@ -1316,6 +1320,26 @@ def _job_context_block(job: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _profile_context_block(profile: dict[str, str]) -> str:
+    """Render the saved company profile so the model never asks for it again."""
+    company = profile.get("company_name") or ""
+    interviewer = profile.get("interviewer_name") or ""
+    phone = profile.get("company_phone") or ""
+    return "\n".join(
+        [
+            "SAVED COMPANY PROFILE (already provided by the recruiter — use automatically, never ask again):",
+            f"- Company name: {company or 'not set'}",
+            f"- Interviewer / host name: {interviewer or 'not set'}",
+            f"- Company phone: {phone or 'not set'}",
+            "Use these in every email signature and interview invitation. For the phone number "
+            "write the literal [Phone] placeholder; the server fills it from this profile. "
+            "You may also use [Company] and [Interviewer Name]. Never ask the recruiter for the "
+            "company name, phone number or interviewer name. Only use a different value if the "
+            "recruiter explicitly gives one in this conversation.",
+        ]
+    )
+
+
 # --------------------------------------------------------------------- Streaming Turn Runner
 async def run_assistant_stream(
     *,
@@ -1420,6 +1444,9 @@ async def run_assistant_stream(
                     + "recruiter to click the connect link to finish. Never claim a not-connected "
                     + "app action succeeded."
                 )
+
+        profile = await get_workspace_profile(session, workspace_id)
+        system_prompt += "\n\n" + _profile_context_block(profile)
 
         tools = _domain_tools(
             session=session,

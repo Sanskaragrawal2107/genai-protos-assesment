@@ -5,6 +5,7 @@ import { usePathname, useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 import {
   Briefcase,
+  Building2,
   CalendarDays,
   ChevronsUpDown,
   LayoutDashboard,
@@ -22,6 +23,7 @@ import {
 } from "lucide-react";
 import { useAuth, useWorkspace } from "@/app/providers";
 import { Avatar } from "@/components/ui";
+import { CompanyProfileOnboarding } from "@/components/CompanyProfileOnboarding";
 import { initials } from "@/lib/format";
 
 const MAIN_NAV = [
@@ -36,6 +38,7 @@ const MAIN_NAV = [
 const INTELLIGENCE_NAV = [{ href: "/assistant", label: "Assistant", icon: MessageSquare }];
 
 const SETTINGS_NAV = [
+  { href: "/settings/company", label: "Company", icon: Building2 },
   { href: "/settings/integrations", label: "Integrations", icon: Plug },
   { href: "/settings/sync", label: "Inbox sync", icon: RefreshCw },
   { href: "/settings/team", label: "Workspace", icon: Users },
@@ -305,6 +308,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           {children}
         </main>
       </div>
+      <CompanyProfileOnboarding />
     </div>
   );
 }
@@ -342,6 +346,7 @@ function pageTitle(pathname: string) {
   if (pathname.startsWith("/shortlists")) return "Shortlists";
   if (pathname.startsWith("/interviews")) return "Interviews";
   if (pathname.startsWith("/communications")) return "Inbox & outreach";
+  if (pathname.startsWith("/settings/company")) return "Company profile";
   if (pathname.startsWith("/settings")) return "Settings";
   return "Recruiter OS";
 }

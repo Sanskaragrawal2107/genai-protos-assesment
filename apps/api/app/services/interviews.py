@@ -34,6 +34,7 @@ from ..repo import (
     create_pending_action,
     find_account,
     get_candidate,
+    get_workspace_profile,
     log_activity,
     normalize_meeting_provider,
     set_candidate_status,
@@ -274,6 +275,7 @@ async def _queue_confirmation(
     kind: str = "interview_confirmation",
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     recruiter_email = await _recruiter_email(session, workspace_id, recruiter_id)
+    profile = await get_workspace_profile(session, workspace_id)
     interview_view = {
         "provider": provider,
         "start_time": start.isoformat(),
@@ -287,6 +289,9 @@ async def _queue_confirmation(
         recruiter_name=recruiter_email or "Recruiting team",
         interview=interview_view,
         notes=notes,
+        company_name=profile["company_name"] or None,
+        interviewer_name=profile["interviewer_name"] or None,
+        company_phone=profile["company_phone"] or None,
     )
     comm = await queue_email(
         session,

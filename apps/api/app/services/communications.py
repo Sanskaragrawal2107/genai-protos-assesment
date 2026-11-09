@@ -21,9 +21,10 @@ import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..composio import IntegrationError
+from ..config import settings
 from ..db import candidate_communications, candidates, utcnow
 from ..llm import LLMError, LLMUnavailable, llm
-from ..repo import find_account, log_activity
+from ..repo import find_account, log_activity, workspace_profile
 from .mail import get_mail_provider
 
 log = logging.getLogger("recruiter.comms")
@@ -45,6 +46,86 @@ def _coerce_dt(value: Any) -> datetime | None:
         except ValueError:
             return None
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _placeholder_replacements(
+    *,
+    date_label: str,
+    time_label: str,
+    tz_label: str,
+    has_start: bool,
+    prov_label: str,
+    meet_url: str,
+    resolved_company: str,
+    resolved_interviewer: str,
+    company_phone: str,
+    sender: str,
+    omit_contact: bool,
+) -> dict[str, str]:
+    """Pure placeholder map shared by the assistant and the send-time net.
+
+    Kept side-effect free so the "every bracket token resolves" contract can be
+    tested without a database. The phone number is intentionally the only value
+    that can resolve to an empty string (never a fabricated number); every other
+    unknown becomes an explicit "to be confirmed" marker.
+    """
+    tbc = "to be confirmed"
+    return {
+        "[DATE]": date_label or tbc,
+        "[Date]": date_label or tbc,
+        "[date]": date_label or tbc,
+        "[TIME]": time_label or tbc,
+        "[Time]": time_label or tbc,
+        "[time]": time_label or tbc,
+        "[TIMEZONE]": (tz_label if has_start else "") or tbc,
+        "[Timezone]": (tz_label if has_start else "") or tbc,
+        "[Time Zone]": (tz_label if has_start else "") or tbc,
+        "[timezone]": (tz_label if has_start else "") or tbc,
+        "[MEETING_PROVIDER]": prov_label or tbc,
+        "[Meeting Provider]": prov_label or tbc,
+        "[Platform]": prov_label or tbc,
+        "[JOIN_LINK]": meet_url or tbc,
+        "[Join Link]": meet_url or tbc,
+        "[Join link]": meet_url or tbc,
+        "[join_link]": meet_url or tbc,
+        "[MEETING_LINK]": meet_url or tbc,
+        "[Meeting Link]": meet_url or tbc,
+        "[LINK]": meet_url or tbc,
+        "[Link]": meet_url or tbc,
+        "[Interviewer Name]": resolved_interviewer or tbc,
+        "[Interviewer]": resolved_interviewer or tbc,
+        "[Reviewer]": resolved_interviewer or tbc,
+        "[Reviewer Name]": resolved_interviewer or tbc,
+        "[Your Name]": resolved_interviewer or tbc,
+        "[Recruiter Name]": resolved_interviewer or tbc,
+        "[Company]": resolved_company or tbc,
+        "[Company Name]": resolved_company or tbc,
+        # Filled from the saved company profile so the recruiter is never asked.
+        "[Phone]": company_phone,
+        "[Phone Number]": company_phone,
+        "[Company Phone]": company_phone,
+        "[Company Number]": company_phone,
+        "[Title]": "Recruiting Team",
+        "[Your Title]": "Recruiting Team",
+        "[Email]": "" if omit_contact else sender,
+        "[LinkedIn]": "",
+    }
+
+
+def _finalize_filled_body(
+    body: str, *, company_phone: str, sender: str, omit_contact: bool
+) -> str:
+    """Strip empty optional lines after placeholder substitution (pure)."""
+    import re
+
+    body = re.sub(r"\n\s*\[(LinkedIn|Title|Company|Your Name|Email)\]", "", body)
+    if not company_phone:
+        # [Phone] resolved to nothing (no saved number): drop a now-empty
+        # "Phone:" label rather than leaving a dangling line with no number.
+        body = re.sub(r"(?im)^[ \t]*(?:phone|tel|telephone)\s*[:\-]?[ \t]*$", "", body)
+    if omit_contact and sender:
+        body = body.replace(sender, "")
+    return re.sub(r"\n{3,}", "\n\n", body).strip()
 
 
 async def hydrate_placeholders(
@@ -85,16 +166,27 @@ async def hydrate_placeholders(
     sender = (sender_email or "").strip()
     sender_name = sender.split("@")[0].replace(".", " ").title() if sender else ""
 
-    resolved_company = (company_name or "").strip()
-    if not resolved_company:
-        ws_row = (
-            await session.execute(
-                sa.select(workspaces_table.c.name).where(workspaces_table.c.id == workspace_id)
+    ws_row = (
+        await session.execute(
+            sa.select(workspaces_table.c.name, workspaces_table.c.settings).where(
+                workspaces_table.c.id == workspace_id
             )
-        ).first()
-        resolved_company = (ws_row[0] if ws_row and ws_row[0] else "") or ""
+        )
+    ).first()
+    ws_name = (ws_row[0] if ws_row and ws_row[0] else "") or ""
+    profile = workspace_profile(
+        {"settings": ws_row[1]} if ws_row else None
+    )
 
-    resolved_interviewer = (interviewer_name or "").strip() or sender_name
+    # Saved profile wins over the raw workspace name; an explicit per-email
+    # argument wins over the profile.
+    resolved_company = (company_name or "").strip() or profile["company_name"] or ws_name
+    resolved_interviewer = (interviewer_name or "").strip() or profile["interviewer_name"] or sender_name
+    # The phone number is never asked for in chat: the assistant writes the
+    # [Phone] token and the server fills it from the saved profile (or the
+    # configured fallback). If neither is set the line is dropped rather than
+    # fabricating a number.
+    company_phone = profile["company_phone"] or (settings.company_phone_fallback or "").strip()
 
     meet_url = (int_row.get("meeting_url") if int_row else "") or ""
     prov_label = _PROVIDER_LABELS.get((int_row.get("provider") if int_row else "") or "", "")
@@ -112,43 +204,19 @@ async def hydrate_placeholders(
         except Exception:  # noqa: BLE001 - unknown tz should not break the send
             pass
 
-    tbc = "to be confirmed"
-    replacements = {
-        "[DATE]": date_label or tbc,
-        "[Date]": date_label or tbc,
-        "[date]": date_label or tbc,
-        "[TIME]": time_label or tbc,
-        "[Time]": time_label or tbc,
-        "[time]": time_label or tbc,
-        "[TIMEZONE]": (tz_label if start_time else "") or tbc,
-        "[Timezone]": (tz_label if start_time else "") or tbc,
-        "[Time Zone]": (tz_label if start_time else "") or tbc,
-        "[timezone]": (tz_label if start_time else "") or tbc,
-        "[MEETING_PROVIDER]": prov_label or tbc,
-        "[Meeting Provider]": prov_label or tbc,
-        "[Platform]": prov_label or tbc,
-        "[JOIN_LINK]": meet_url or tbc,
-        "[Join Link]": meet_url or tbc,
-        "[Join link]": meet_url or tbc,
-        "[join_link]": meet_url or tbc,
-        "[MEETING_LINK]": meet_url or tbc,
-        "[Meeting Link]": meet_url or tbc,
-        "[LINK]": meet_url or tbc,
-        "[Link]": meet_url or tbc,
-        "[Interviewer Name]": resolved_interviewer or tbc,
-        "[Interviewer]": resolved_interviewer or tbc,
-        "[Reviewer]": resolved_interviewer or tbc,
-        "[Reviewer Name]": resolved_interviewer or tbc,
-        "[Your Name]": resolved_interviewer or tbc,
-        "[Recruiter Name]": resolved_interviewer or tbc,
-        "[Company]": resolved_company or tbc,
-        "[Company Name]": resolved_company or tbc,
-        "[Title]": "Recruiting Team",
-        "[Your Title]": "Recruiting Team",
-        "[Phone]": "",
-        "[Email]": "" if omit_contact else sender,
-        "[LinkedIn]": "",
-    }
+    replacements = _placeholder_replacements(
+        date_label=date_label,
+        time_label=time_label,
+        tz_label=tz_label,
+        has_start=bool(start_time),
+        prov_label=prov_label,
+        meet_url=meet_url,
+        resolved_company=resolved_company,
+        resolved_interviewer=resolved_interviewer,
+        company_phone=company_phone,
+        sender=sender,
+        omit_contact=omit_contact,
+    )
 
     def _fill(text: str) -> str:
         for key, value in replacements.items():
@@ -158,12 +226,9 @@ async def hydrate_placeholders(
     h_subj = _fill(subject)
     h_body = _fill(body)
 
-    import re
-
-    h_body = re.sub(r"\n\s*\[(Phone|LinkedIn|Title|Company|Your Name|Email)\]", "", h_body)
-    if omit_contact and sender:
-        h_body = h_body.replace(sender, "")
-    h_body = re.sub(r"\n{3,}", "\n\n", h_body).strip()
+    h_body = _finalize_filled_body(
+        h_body, company_phone=company_phone, sender=sender, omit_contact=omit_contact
+    )
 
     if meet_url and meet_url not in h_body:
         h_body += (
@@ -181,6 +246,7 @@ async def hydrate_placeholders(
         "provider": prov_label,
         "join_url": meet_url,
         "company": resolved_company,
+        "company_phone": company_phone,
         "interviewer": resolved_interviewer,
         "interviewer_email": sender if not omit_contact else None,
     }
@@ -200,7 +266,8 @@ _DRAFT_SYSTEM = (
     "'subject' and 'body'. The body is plain text, under 180 words, friendly and "
     "specific, and must only contain facts supplied in the input. Never invent an "
     "interview time, a meeting link, a salary or a company detail. Sign off with the "
-    "recruiter's name if provided."
+    "interviewer name (or the recruiter's name if no interviewer is supplied), then "
+    "the company name and company phone from the input when present."
 )
 
 
@@ -212,9 +279,23 @@ def _template(
     job_title: str | None,
     interview: dict[str, Any] | None,
     notes: str | None,
+    company_name: str | None = None,
+    interviewer_name: str | None = None,
+    company_phone: str | None = None,
 ) -> tuple[str, str]:
     first_name = (candidate.get("full_name") or "there").split(" ")[0]
     role = job_title or candidate.get("applied_role") or candidate.get("current_role") or "this role"
+
+    def signoff() -> list[str]:
+        # The interviewer who will run the interview signs; the company and its
+        # phone come from the saved profile so the recruiter is never asked again.
+        name = (interviewer_name or "").strip() or recruiter_name
+        lines = ["", "Best regards,", name]
+        if (company_name or "").strip():
+            lines.append(company_name.strip())
+        if (company_phone or "").strip():
+            lines.append(company_phone.strip())
+        return lines
 
     if kind == "interview_confirmation" and interview:
         when = interview.get("start_label") or interview.get("start_time")
@@ -246,13 +327,8 @@ def _template(
             )
         if notes:
             body += ["", notes]
-        body += [
-            "",
-            "Please reply if you need a different slot and we will rearrange.",
-            "",
-            "Best regards,",
-            recruiter_name,
-        ]
+        body += ["", "Please reply if you need a different slot and we will rearrange."]
+        body += signoff()
         return f"Interview scheduled — {role}", "\n".join(body)
 
     if kind == "reschedule" and interview:
@@ -267,13 +343,8 @@ def _template(
         ]
         if link:
             body.append(f"Join link: {link}")
-        body += [
-            "",
-            "Apologies for the change — please let me know if the new time does not work.",
-            "",
-            "Best regards,",
-            recruiter_name,
-        ]
+        body += ["", "Apologies for the change — please let me know if the new time does not work."]
+        body += signoff()
         return f"Updated interview time — {role}", "\n".join(body)
 
     if kind == "rejection":
@@ -286,10 +357,8 @@ def _template(
             "After reviewing your experience against the current requirements, we will not be "
             "moving forward with your application at this stage. This is not a reflection of your "
             "abilities, and we would be glad to stay in touch for future openings.",
-            "",
-            "Best regards,",
-            recruiter_name,
         ]
+        body += signoff()
         return f"Update on your application — {role}", "\n".join(body)
 
     if kind == "reminder":
@@ -298,10 +367,8 @@ def _template(
             "",
             f"Just a quick reminder about our conversation regarding {role}. "
             "If you are still interested, reply with a good time this week and I will set it up.",
-            "",
-            "Best regards,",
-            recruiter_name,
         ]
+        body += signoff()
         return f"Following up — {role}", "\n".join(body)
 
     body = [
@@ -313,10 +380,8 @@ def _template(
         "",
         "If you are still exploring opportunities, reply with a couple of times that suit you "
         "and I will send an invite.",
-        "",
-        "Best regards,",
-        recruiter_name,
     ]
+    body += signoff()
     return f"Following up on your application — {role}", "\n".join(body)
 
 
@@ -329,6 +394,9 @@ async def draft_email(
     interview: dict[str, Any] | None = None,
     notes: str | None = None,
     instructions: str | None = None,
+    company_name: str | None = None,
+    interviewer_name: str | None = None,
+    company_phone: str | None = None,
 ) -> tuple[str, str, str]:
     """Return ``(subject, body, method)``. LLM when available, template otherwise."""
     subject, body = _template(
@@ -338,6 +406,9 @@ async def draft_email(
         job_title=job_title,
         interview=interview,
         notes=notes,
+        company_name=company_name,
+        interviewer_name=interviewer_name,
+        company_phone=company_phone,
     )
     if not llm.enabled:
         return subject, body, "template"
@@ -352,6 +423,9 @@ async def draft_email(
         "job_title": job_title,
         "interview": interview,
         "recruiter_name": recruiter_name,
+        "company_name": company_name,
+        "interviewer_name": interviewer_name,
+        "company_phone": company_phone,
         "extra_instructions": instructions,
         "baseline_draft": {"subject": subject, "body": body},
     }

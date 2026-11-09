@@ -80,6 +80,11 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     # Shared secret for cron/worker -> API calls (Authorization: Bearer ...).
     api_internal_token: str = ""
+    # Optional phone number used when the workspace profile has none. The
+    # assistant writes the [Phone] token; the server fills it from the saved
+    # company phone first, then this fallback. Empty = omit the phone line
+    # rather than fabricate a number.
+    company_phone_fallback: str = ""
 
     # database — Supabase Postgres only (asyncpg driver).
     database_url: str = ""

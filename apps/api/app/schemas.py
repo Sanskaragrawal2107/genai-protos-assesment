@@ -228,6 +228,15 @@ class ScheduleRequest(BaseModel):
     idempotency_key: str | None = None
 
 
+# ------------------------------------------------------------- workspace profile
+class WorkspaceProfileIn(BaseModel):
+    """Company details used automatically in every outbound email."""
+
+    company_name: str | None = Field(default=None, max_length=200)
+    company_phone: str | None = Field(default=None, max_length=60)
+    interviewer_name: str | None = Field(default=None, max_length=160)
+
+
 # --------------------------------------------------------------------- chat
 class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=4000)

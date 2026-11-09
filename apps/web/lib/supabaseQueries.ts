@@ -53,6 +53,7 @@ export async function fetchMeDirect(supabase: SupabaseClient): Promise<any> {
 
   let wsId: string = "default";
   let wsName = "Recruitment Workspace";
+  let wsSettings: Record<string, any> = {};
 
   const { data: member } = await supabase
     .from("workspace_members")
@@ -66,11 +67,13 @@ export async function fetchMeDirect(supabase: SupabaseClient): Promise<any> {
     wsId = member.workspace_id;
     const wsData: any = member.workspaces;
     if (wsData?.name) wsName = wsData.name;
+    if (wsData?.settings) wsSettings = wsData.settings;
   } else {
     const { data: ws } = await supabase.from("workspaces").select("id, name, settings").limit(1).maybeSingle();
     if (ws) {
       wsId = ws.id;
       wsName = ws.name || wsName;
+      if (ws.settings) wsSettings = ws.settings;
     }
   }
 
@@ -90,6 +93,11 @@ export async function fetchMeDirect(supabase: SupabaseClient): Promise<any> {
     workspace: {
       id: wsId,
       name: wsName,
+      company_name: typeof wsSettings.company_name === "string" ? wsSettings.company_name : "",
+      company_phone: typeof wsSettings.company_phone === "string" ? wsSettings.company_phone : "",
+      interviewer_name:
+        typeof wsSettings.interviewer_name === "string" ? wsSettings.interviewer_name : "",
+      profile_complete: Boolean(wsSettings.company_name),
     },
     capabilities: {
       llm: true,

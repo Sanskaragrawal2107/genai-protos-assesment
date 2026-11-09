@@ -106,6 +106,59 @@ async def get_workspace(session: AsyncSession, workspace_id: str) -> dict[str, A
     return dict(row) if row else None
 
 
+# Company details the recruiter fills in once (onboarding or Settings). They live
+# in the existing ``workspaces.settings`` JSON, so no schema migration is needed.
+COMPANY_PROFILE_KEYS = ("company_name", "company_phone", "interviewer_name")
+
+
+def _clean_profile_value(value: Any) -> str:
+    return value.strip() if isinstance(value, str) else ""
+
+
+def workspace_profile(ws: dict[str, Any] | None) -> dict[str, str]:
+    """Return the saved company profile (company name, phone, interviewer)."""
+    settings = (ws or {}).get("settings") or {}
+    return {key: _clean_profile_value(settings.get(key)) for key in COMPANY_PROFILE_KEYS}
+
+
+async def get_workspace_profile(session: AsyncSession, workspace_id: str) -> dict[str, str]:
+    return workspace_profile(await get_workspace(session, workspace_id))
+
+
+async def set_workspace_profile(
+    session: AsyncSession,
+    workspace_id: str,
+    *,
+    company_name: str | None = None,
+    company_phone: str | None = None,
+    interviewer_name: str | None = None,
+) -> dict[str, str]:
+    """Merge the company profile into ``workspaces.settings``.
+
+    Only keys passed as non-None are changed, so a partial update never clears
+    the other fields. Other settings (e.g. ``require_approval``) are preserved.
+    """
+    ws = await get_workspace(session, workspace_id)
+    if not ws:
+        return {}
+    settings = dict(ws.get("settings") or {})
+    updates = {
+        "company_name": company_name,
+        "company_phone": company_phone,
+        "interviewer_name": interviewer_name,
+    }
+    for key, value in updates.items():
+        if value is not None:
+            settings[key] = _clean_profile_value(value)
+    await session.execute(
+        sa.update(workspaces)
+        .where(workspaces.c.id == workspace_id)
+        .values(settings=settings, updated_at=db.utcnow())
+    )
+    await session.commit()
+    return workspace_profile({"settings": settings})
+
+
 MEETING_PROVIDERS = {"microsoft_teams", "google_meet", "none"}
 
 # Older workspace settings stored these values; map them onto the canonical id.

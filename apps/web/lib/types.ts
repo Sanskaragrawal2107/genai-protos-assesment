@@ -212,7 +212,14 @@ export interface SyncSnapshot {
 
 export interface Me {
   identity: { user_id: string; email?: string | null; name?: string | null; mode: string };
-  workspace: { id: string; name: string };
+  workspace: {
+    id: string;
+    name: string;
+    company_name: string;
+    company_phone: string;
+    interviewer_name: string;
+    profile_complete: boolean;
+  };
   capabilities: {
     llm: boolean;
     composio: boolean;
